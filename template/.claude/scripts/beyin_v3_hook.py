@@ -412,7 +412,7 @@ def main():
             # Opt-in capture queue (beyin.py yakala kur): one directory listing, never a model call.
             try:
                 from beyin_v3_yakala import session_notice
-                notice += session_notice(vault)
+                notice += session_notice(vault, state)
             except Exception:
                 pass
         if not args.metadata_only and event in ('SessionStart', 'PostToolUse') and (state / 'hygiene.json').is_file():
