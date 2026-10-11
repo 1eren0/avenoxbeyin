@@ -26,6 +26,61 @@ Kısayol ek paket istemez; Python'un kendisiyle çalışır. Mac'te bir oturum a
 (LaunchAgent) tuşu dinler, Windows'ta Başlat menüsündeki kısayol tuşu kullanılır.
 Yalnız şablon ve skill istiyorsan: `python3 beyin.py yakala kur --kisayol-yok`.
 
+### Linux
+
+Linux'ta arka planda dinleyen bir servis yok; kısayol masaüstünün kendi kısayol ayarına yazılır.
+`kur`, `~/.local/share/applications/beyne-at.desktop` dosyasını yazar (`XDG_DATA_HOME` mutlak bir
+yolsa orada). Komut `python3 <state>/yakala/beyin_v3_yakala.py pencere --vault <vault>` olur.
+Betiğin bu kopyası state klasöründe durur ve pencereyi açarken vault'taki güncel betiğe geçer;
+güncellemeden sonra `kur`'u yeniden çalıştırman gerekmez.
+
+`Ctrl+Alt+B` (ya da `--tus`) masaüstüne göre kaydedilir:
+
+| Masaüstü | Kısayol | Nerede denendi |
+|---|---|---|
+| KDE Plasma 6 (Wayland) | `kur` kurar | Gerçek masaüstünde: kısayol, bağlantı ve düz metin |
+| GNOME | `kur` kurar | Gerçek masaüstünde denenmedi; yalnız birim testleri var |
+| KDE Plasma 5 | `kur` dener (`kwriteconfig5`) | Denenmedi |
+| Diğerleri (Hyprland, Sway, XFCE...) | Kurulmaz; `kur` bağlanacak komutu verir | Hyprland'de `kur` çıktısı ve `zenity` penceresi denendi |
+
+- **KDE Plasma:** `kwriteconfig6` (yoksa `kwriteconfig5`) ile `kglobalshortcutsrc` içine yazılır,
+  `gdbus` ile oturum kapatmadan etkinleştirilir. `kur` sonra tuşun kimde olduğunu kglobalaccel'e
+  sorar: çıktıdaki `kisayol_calisiyor` ancak tuş bu kısayola bağlıysa `true` olur; tuş başka bir
+  uygulamadaysa ya da soru yanıtsız kalırsa `false`. Sınır: kısayol daha önce başka bir komutla
+  kurulduysa (vault taşındı, Python değişti) KDE çalışan oturumda eski komutu çalıştırmayı
+  sürdürebilir; oturumu kapatıp açınca yenisi geçerli olur. İlk kurulumda bu sorun yok.
+- **GNOME:** `gsettings` ile özel bir kısayol (`custom-keybindings`) eklenir; mevcut kısayolların
+  korunur. Burada `kisayol_calisiyor` yalnız ayarın yazıldığını söyler, tuşun başka bir kısayolla
+  çakışmadığını söylemez. Tuş çalışmazsa Ayarlar > Klavye altındaki özel kısayollarda `Beyne at`
+  girdisine bak ve bir issue aç.
+- **Diğer masaüstleri:** `.desktop` dosyası yazılır, kısayol kurulmaz. `kur` çıktısındaki `ipucu`
+  bağlanacak komutun tamamını verir; onu masaüstünün kısayol ayarına ekle. KDE ya da GNOME'da kayıt
+  doğrulanamazsa da aynı komut `ipucu` olarak verilir.
+
+Linux'ta tuş Ctrl, Alt ya da Super ile birlikte bir harf, rakam, boşluk ya da F1-F12 olabilir.
+Kısayol tek bir vault'a hizmet eder: başka bir vault'ta `kur` çalıştırırsan kısayol ona geçer ve
+çıktıdaki `onceki_vault` eskisini söyler. `kaldir` yalnız bu vault'un kurduğu `.desktop` dosyasını
+ve kısayolu siler. Masaüstü `XDG_CURRENT_DESKTOP` değişkeninden tanınır; `kur` ve `kaldir`'ı
+masaüstü oturumundaki bir terminalden çalıştır. SSH gibi bu değişkenin olmadığı bir oturumda
+kısayol kurulmaz, kaldırırken de masaüstündeki kısayol ayarı yerinde kalır.
+
+Pencere neyi kaydedeceğini panodan okur: Wayland'da `wl-clipboard` paketi (`wl-paste`) gerekir.
+X11'de tam pencere metni kendisi okur; kopyalanan dosyalar ve `kdialog`/`zenity` yolu için `xclip`
+ya da `xsel` gerekir. Panoda tek bir bağlantı varsa bağlantı, dosya
+yöneticisinden kopyalanan dosyalar (`file://` listesi) varsa dosyalar, başka metin varsa metin
+yakalanır. Yalnız görsel kopyalandıysa pano boş sayılır; bu araçlarla okunan metnin en fazla 1 MB'ı
+alınır ve kartta kesildiği yazar.
+Kopyalanan dosyaların yakalanması gerçek masaüstünde denenmedi, yalnız birim testleri var.
+
+Tam pencere `tkinter` ister. Arch tabanlı dağıtımlarda Python'un `tk` paketi ayrıdır
+(`sudo pacman -S tk`), Debian ve Ubuntu'da `sudo apt install python3-tk`. `tkinter` yoksa pencere
+yerine `kdialog`, o da yoksa `zenity` ile yalnız "neden" sorulur; iptal edersen kart yazılmaz.
+Üçü de yoksa hiçbir şey kaydedilmez ve `kur` bunu uyarı olarak söyler.
+
+Doğrulamak için: `python3 beyin.py yakala durum` (`Kisayol dinleyicisi: calisiyor`), KDE'de
+`gdbus call --session -d org.kde.kglobalaccel -o /component/beyne_at_desktop -m org.kde.kglobalaccel.Component.isActive`
+(`(true,)` beklenir), sonra kısayola bas.
+
 ### Kısayolu değiştir
 
 ```sh

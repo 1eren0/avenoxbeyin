@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 sys.dont_write_bytecode = True
 
@@ -764,9 +764,58 @@ def windows_context():
         return {}
 
 
+def _try(command, timeout=5):
+    """(returncode, stdout); (None, '') when the tool is missing or hangs."""
+    try:
+        code, out, _ = _run(command, timeout)
+        return code, out
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ''
+
+
+def _linux_clipboard():
+    """Clipboard text through one helper: wl-paste on Wayland (the reader the window uses), else xclip or xsel."""
+    text = _wl_paste()
+    if text is None:
+        for name, options in (('xclip', ['-o', '-selection', 'clipboard']), ('xsel', ['-ob'])):
+            tool = _which(name)
+            if tool:
+                text = _tool_text([tool] + options)
+                break
+    return repair_mojibake(text or '')
+
+
+def _file_uri_path(line):
+    """Path of a local file:// URI; None for other text and for a URI that names another machine."""
+    match = re.fullmatch(r'file://(?:localhost)?(/.*)', line)
+    return unquote(match.group(1)) if match else None
+
+
+def linux_context():
+    """The clipboard is the only portable source on Linux: a link, copied files or plain text.
+
+    Read like the window reads it on macOS and Windows: only a clipboard that is one link is a
+    link. A link followed by more lines is text, so nothing after the first line is dropped.
+    """
+    text = _linux_clipboard().strip()
+    if not text:
+        return {}
+    if re.fullmatch(r'https?://\S+', text):
+        return {'url': text}
+    # File managers copy files as a text/uri-list: one file:// URI per line, '#' lines are comments.
+    lines = [line.strip() for line in text.splitlines()]
+    paths = [_file_uri_path(line) for line in lines if line and not line.startswith('#')]
+    if paths and all(paths):
+        paths = [path for path in paths if Path(path).is_file()]
+        return {'dosyalar': paths[:20]} if paths else {}
+    return {'metin': text}
+
+
 def gather_context():
     if sys.platform == 'darwin':
         return mac_context()
+    if sys.platform.startswith('linux'):
+        return linux_context()
     if os.name == 'nt':
         return windows_context()
     return {}
@@ -1126,17 +1175,56 @@ def popup(vault, context=None, state=None):
     return result or {'status': 'vazgecildi'}
 
 
+LINUX_NO_WINDOW = ('Pencere acilamiyor: bu Python\'da tkinter yok, kdialog ya da zenity de kurulu degil. Birini kur '
+                   '(Arch: sudo pacman -S tk, Debian/Ubuntu: sudo apt install python3-tk) ya da beyin.py yakala ekle kullan.')
+
+
+def _linux_window():
+    """What can show the window here: 'tkinter', the path of kdialog or zenity, or None."""
+    try:
+        import tkinter  # noqa: F401
+        return 'tkinter'
+    except ImportError:
+        return _which('kdialog', 'zenity')
+
+
+def _linux_ask(shown=''):
+    """Reason typed in kdialog or zenity; None when cancelled. Neither tool: an error, nothing is saved unseen.
+
+    `shown` comes from the clipboard. It is never an argument of its own and never the start of one:
+    it follows the fixed question inside the value of --inputbox / --text. That fixed first line also
+    keeps Qt from reading the label as rich text. Both tools expand backslash escapes, and zenity
+    drops a single underscore as a mnemonic (--entry has no Pango markup), hence the doubling.
+    """
+    shown = re.sub(r'[\x00-\x1f\x7f]+', ' ', str(shown)).strip()[:120].replace('\\', '\\\\')
+    kdialog, zenity = _which('kdialog'), _which('zenity')
+    if kdialog:
+        command = [kdialog, '--title', 'Beyne at', '--inputbox', 'Neden kaydediyorsun?' + ('\n' + shown if shown else ''), '']
+    elif zenity:
+        command = [zenity, '--entry', '--title', 'Beyne at', '--text',
+                   'Neden kaydediyorsun?' + ('\n' + shown.replace('_', '__') if shown else '')]
+    else:
+        raise ValueError(LINUX_NO_WINDOW)
+    code, out = _try(command, timeout=300)
+    return out.strip() if code == 0 else None
+
+
 def _popup_fallback(vault, context, state=None):
     """No tkinter (some Homebrew/Linux Pythons): the OS dialog asks only for the reason."""
     why = ''
+    url, files, text = context.get('url'), context.get('dosyalar') or [], context.get('metin') or ''
     if sys.platform == 'darwin':
         why = _osascript('text returned of (display dialog "Neden kaydediyorsun?" default answer "" with title "Beyne at")', timeout=300) or ''
-    url = context.get('url')
-    if not (url or context.get('dosyalar') or why):
+    elif sys.platform.startswith('linux'):
+        why = _linux_ask(url or ', '.join(Path(f).name for f in files) or text)
+        if why is None:
+            return {'status': 'vazgecildi'}
+    if not (url or files or text or why):
         return {'status': 'vazgecildi'}
-    return capture(vault, url=url, text=None if url or context.get('dosyalar') else why, files=context.get('dosyalar') or [],
-                   why=why if url or context.get('dosyalar') else '', app=context.get('uygulama'), title=context.get('baslik'),
-                   state=state)
+    if text and not (url or files):  # clipboard text is the content; the dialog answer is the reason
+        return capture(vault, text=text, why=why, app=context.get('uygulama'), title=context.get('baslik'), state=state)
+    return capture(vault, url=url, text=None if url or files else why, files=files,
+                   why=why if url or files else '', app=context.get('uygulama'), title=context.get('baslik'), state=state)
 
 
 # ---------------------------------------------------------------- hotkey spec
@@ -1258,6 +1346,30 @@ def windows_hotkey(spec):
     return value, '+'.join([m.capitalize() for m in mods] + [key.upper()])
 
 
+QT_MODS = {'ctrl': 0x04000000, 'alt': 0x08000000, 'shift': 0x02000000, 'cmd': 0x10000000}
+KDE_MODS = {'ctrl': 'Ctrl', 'alt': 'Alt', 'shift': 'Shift', 'cmd': 'Meta'}
+GNOME_MODS = {'ctrl': '<Control>', 'alt': '<Alt>', 'shift': '<Shift>', 'cmd': '<Super>'}
+
+
+def linux_hotkey(spec):
+    """-> (KDE text, Qt key int, GNOME accelerator, label); letter, digit, F1-F12 or space."""
+    mods, key = parse_hotkey(spec)
+    key = {'bosluk': 'space'}.get(key.lower(), key)
+    if not (re.fullmatch(r'[A-Za-z0-9]', key) or key.lower() == 'space' or re.fullmatch(r'[fF]([1-9]|1[0-2])', key)):
+        raise ValueError('Linux kisayolunda yalniz harf, rakam, bosluk ya da F1-F12 tusu olabilir')
+    if not [m for m in mods if m in ('ctrl', 'alt', 'cmd')]:
+        raise ValueError('Linux kisayolu Ctrl, Alt ya da Super icermeli')
+    if key.lower() == 'space':
+        name, code, accel = 'Space', 0x20, 'space'
+    elif len(key) == 1:
+        name, code, accel = key.upper(), ord(key.upper()), key.lower()
+    else:
+        name, code, accel = key.upper(), 0x01000030 + int(key[1:]) - 1, key.upper()
+    qt = sum(QT_MODS[m] for m in mods) + code
+    kde = '+'.join([KDE_MODS[m] for m in mods] + [name])
+    return kde, qt, ''.join(GNOME_MODS[m] for m in mods) + accel, kde.replace('Meta', 'Super')
+
+
 def saved_hotkey(state):
     try:
         return json.loads(_state_path(state).read_text(encoding='utf-8')).get('tus') or DEFAULT_HOTKEY
@@ -1329,7 +1441,7 @@ description: Kullanıcının yakaladığı kaynakları (YouTube videosu, tweet, 
 
 # Beyne at: yakalanan kaynakları işle
 
-Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows'ta Ctrl+Alt+B),
+Kullanıcı kaynakları tek tuşla yakalar: kısayol (Mac'te Control+Option+B, Windows'ta Ctrl+Alt+B, Linux'ta KDE ve GNOME'da Ctrl+Alt+B),
 tarayıcıda Obsidian Web Clipper'ın "Beyne at" şablonu ya da Windows'ta sağ tık > Gönder > Beyne At.
 Her yakalama `📥 000-Inbox/Yakala/` içinde tek bir karttır. Kartın `## Neden` bölümü kullanıcının
 niyetidir; dersleri o niyete göre seç.
@@ -1452,12 +1564,137 @@ def _argline(values):
     return subprocess.list2cmdline([str(v) for v in values])
 
 
+DESKTOP_NAME = 'beyne-at.desktop'
+GNOME_KEYS = 'org.gnome.settings-daemon.plugins.media-keys'
+GNOME_PATH = '/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/beyne-at/'
+KGLOBAL = ['gdbus', 'call', '--session', '-d', 'org.kde.kglobalaccel']
+KDE_ACTION = "['beyne-at.desktop','_launch','Beyne At','Beyne At']"
+
+
+def _desktop_file():
+    data = os.environ.get('XDG_DATA_HOME') or ''
+    # The basedir spec: a relative XDG_DATA_HOME is invalid and ignored (it would land under the working directory).
+    return (Path(data) if os.path.isabs(data) else Path.home() / '.local/share') / 'applications' / DESKTOP_NAME
+
+
+def _linux_desktop():
+    current = os.environ.get('XDG_CURRENT_DESKTOP', '').upper()
+    return 'kde' if 'KDE' in current else 'gnome' if 'GNOME' in current else None
+
+
+def _desktop_string(value):
+    """String value of a desktop entry: backslash, newline, tab and carriage return are escaped."""
+    return str(value).replace('\\', '\\\\').replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
+
+
+def _desktop_quote(arg):
+    """Exec argument per the Desktop Entry spec, then the string-value escaping of the file itself."""
+    arg = str(arg)
+    if not arg or re.search(r'[\s"\'\\><~|&;$*?#()`%]', arg):
+        arg = '"' + re.sub(r'(["`$\\])', r'\\\1', arg).replace('%', '%%') + '"'
+    return _desktop_string(arg)
+
+
+def _desktop_entry(argv, vault):
+    """The launcher file. X-Beyin-Vault names the vault it serves; `kaldir` and `durum` touch only their own."""
+    return ('[Desktop Entry]\nType=Application\nName=Beyne at\nComment=İkinci beyne kaynak yakala\n'
+            'Exec=' + ' '.join(_desktop_quote(a) for a in argv) + '\nTerminal=false\nCategories=Utility;\n'
+            'X-Beyin-Vault=' + _desktop_string(vault) + '\n')
+
+
+def _desktop_owner(path):
+    """Vault the entry at `path` serves; None when it is missing, unreadable or not written by `kur`."""
+    try:
+        lines = Path(path).read_text(encoding='utf-8').split('\n')
+    except (OSError, UnicodeDecodeError):
+        return None
+    unescape = {'n': '\n', 't': '\t', 'r': '\r', 's': ' '}
+    for line in lines:
+        if line.startswith('X-Beyin-Vault='):
+            return re.sub(r'\\(.)', lambda match: unescape.get(match.group(1), match.group(1)), line.split('=', 1)[1])
+    return None
+
+
+def _gnome_list():
+    code, out = _try(['gsettings', 'get', GNOME_KEYS, 'custom-keybindings'])
+    if code != 0:
+        return None
+    try:
+        import ast
+        value = ast.literal_eval(out.strip().replace('@as ', '', 1))
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        return None
+    # Anything but a list of strings is not rewritten: the user's own bindings live in it.
+    return list(value) if isinstance(value, list) and all(isinstance(item, str) for item in value) else None
+
+
+def _gvariant(text):
+    """GVariant text of a string. A bare value that starts with a quote makes `gsettings set` fail."""
+    return "'" + str(text).replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def _gnome_set_list(paths):
+    value = '[' + ', '.join(_gvariant(path) for path in paths) + ']'
+    return _try(['gsettings', 'set', GNOME_KEYS, 'custom-keybindings', value])[0] == 0
+
+
+def _gnome_schema():
+    return GNOME_KEYS + '.custom-keybinding:' + GNOME_PATH
+
+
+def _kde_active():
+    code, out = _try(KGLOBAL + ['-o', '/component/beyne_at_desktop', '-m', 'org.kde.kglobalaccel.Component.isActive'])
+    return code == 0 and 'true' in out
+
+
+def _hand_over(vault, state):
+    """The desktop entry starts the copy in the state folder. When the vault has its own module, run that
+    one, so an update reaches the window without a second `kur` (the macOS listener does the same)."""
+    here = Path(__file__).resolve()
+    current = Path(vault) / '.claude/scripts' / here.name
+    if here == (Path(state) / 'yakala' / here.name).resolve() and current.is_file() and current.resolve() != here:
+        try:
+            os.execv(sys.executable, [sys.executable, str(current)] + sys.argv[1:])
+        except OSError:
+            pass  # the copy still opens the window
+
+
+def _linux_hotkey_install(kde, qt, gnome, command):
+    """Registers the key on KDE or GNOME; True/False = key verified, None = desktop not supported."""
+    desktop = _linux_desktop()
+    if desktop == 'kde':
+        writer = _which('kwriteconfig6', 'kwriteconfig5')
+        if not writer or _try([writer, '--file', 'kglobalshortcutsrc', '--group', 'services', '--group', DESKTOP_NAME,
+                               '--key', '_launch', kde])[0] != 0:
+            return False
+        _try([_which('kbuildsycoca6', 'kbuildsycoca5') or 'kbuildsycoca6'], timeout=30)
+        _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.doRegister', KDE_ACTION])
+        # Flags 6 = SetPresent|NoAutoloading; with 4 alone the key is stored but never grabbed.
+        _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.setShortcutKeys', KDE_ACTION, '[([%d],)]' % qt, '6'])
+        code, out = _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.getGlobalShortcutsByKey', str(qt)])
+        return code == 0 and DESKTOP_NAME in out
+    if desktop == 'gnome':
+        paths = _gnome_list()
+        if paths is None:
+            return False
+        if GNOME_PATH not in paths and not _gnome_set_list(paths + [GNOME_PATH]):
+            return False
+        schema = _gnome_schema()
+        for key, value in (('name', 'Beyne at'), ('command', command), ('binding', gnome)):
+            if _try(['gsettings', 'set', schema, key, _gvariant(value)])[0] != 0:
+                return False
+        return GNOME_PATH in (_gnome_list() or [])
+    return None
+
+
 def install(vault, state, hotkey=True, spec=None, folder_spec=None):
     vault, state = Path(vault).resolve(), Path(state).resolve()
     spec = spec or saved_hotkey(state)
     # Validate before anything is written, so a bad key or folder changes nothing.
     if hotkey and sys.platform == 'darwin':
         keycode, modifiers, label = mac_hotkey(spec)
+    elif hotkey and sys.platform.startswith('linux'):
+        kde_key, qt_key, gnome_key, label = linux_hotkey(spec)
     elif hotkey and os.name == 'nt':
         win_value, label = windows_hotkey(spec)
     previous = find_inbox(vault, state)
@@ -1520,6 +1757,28 @@ def install(vault, state, hotkey=True, spec=None, folder_spec=None):
         subprocess.run(['launchctl', 'bootstrap', domain, str(agent)], check=True, capture_output=True)
         done['kisayol'] = label
         done['kisayol_calisiyor'] = _listener_ok()
+    elif hotkey and sys.platform.startswith('linux'):
+        runner = state / 'yakala' / script.name  # copy outside the vault, like the macOS listener
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(script, runner)
+        argv = [sys.executable, str(runner), 'pencere', '--vault', str(vault)]
+        entry = _desktop_file()
+        previous = _desktop_owner(entry)
+        if previous and previous != str(vault):
+            done['onceki_vault'] = previous  # the hotkey moves to this vault
+        entry.parent.mkdir(parents=True, exist_ok=True)
+        entry.write_text(_desktop_entry(argv, vault), encoding='utf-8', newline='\n')
+        import shlex
+        command = shlex.join(argv)
+        running = _linux_hotkey_install(kde_key, qt_key, gnome_key, command)
+        if running is None:
+            done['ipucu'] = 'Masaustu ayarlarindan su komuta bir kisayol bagla: ' + command
+        else:
+            done.update(kisayol=label, kisayol_calisiyor=running)
+            if not running:  # a missing tool or a refused call is not an error: the command still works by hand
+                done['ipucu'] = 'Kisayol dogrulanamadi; calismiyorsa masaustu ayarlarindan su komuta elle bagla: ' + command
+        if not _linux_window():
+            done['uyari'] = LINUX_NO_WINDOW
     elif hotkey and os.name == 'nt':
         pythonw = Path(sys.executable).with_name('pythonw.exe')
         target = pythonw if pythonw.is_file() else Path(sys.executable)
@@ -1544,6 +1803,21 @@ def uninstall(vault, state):
         subprocess.run(['launchctl', 'bootout', 'gui/' + str(os.getuid()) + '/' + LAUNCH_LABEL], capture_output=True)
         _launch_agent().unlink()
         removed.append('LaunchAgent')
+    elif sys.platform.startswith('linux') and _desktop_owner(_desktop_file()) == str(Path(vault).resolve()):
+        _desktop_file().unlink()
+        removed.append(DESKTOP_NAME)
+        desktop = _linux_desktop()
+        if desktop == 'kde':
+            writer = _which('kwriteconfig6', 'kwriteconfig5')
+            if writer:
+                _try([writer, '--file', 'kglobalshortcutsrc', '--group', 'services', '--group', DESKTOP_NAME,
+                      '--key', '_launch', '--delete'])
+            _try(KGLOBAL + ['-o', '/kglobalaccel', '-m', 'org.kde.KGlobalAccel.unregister', DESKTOP_NAME, '_launch'])
+        elif desktop == 'gnome':
+            paths = _gnome_list() or []
+            if GNOME_PATH in paths:
+                _gnome_set_list([p for p in paths if p != GNOME_PATH])
+            _try(['gsettings', 'reset-recursively', _gnome_schema()])
     elif os.name == 'nt':
         for folder in _windows_dirs():
             link = folder / 'Beyne At.lnk'
@@ -1577,6 +1851,12 @@ def status(vault, state):
     running = None
     if sys.platform == 'darwin' and _agent_vault() == str(Path(vault).resolve()):
         running = _listener_ok(wait=0)
+    elif sys.platform.startswith('linux') and _desktop_owner(_desktop_file()) == str(Path(vault).resolve()):
+        desktop = _linux_desktop()
+        if desktop == 'kde':
+            running = _kde_active()
+        elif desktop == 'gnome':
+            running = GNOME_PATH in (_gnome_list() or [])
     return {'status': 'tamam', 'kurulu': installed, 'dinleyici_calisiyor': running,
             'bekleyen': pending(vault, state), 'klasor': find_inbox(vault, state),
             'araclar': {name: bool(path) for name, path in tools().items()}}
@@ -1631,6 +1911,10 @@ def human(result, command):
             lines.append('Kisayol: ' + result['kisayol'] + ' (her uygulamada calisir).')
         if result.get('kisayol_calisiyor') is False:
             lines.append('UYARI: kisayol dinleyicisi baslamadi; bu tus baska bir uygulamada kayitli olabilir. Baska bir tus dene.')
+        if result.get('ipucu'):
+            lines.append(result['ipucu'])
+        if result.get('uyari'):
+            lines.append('UYARI: ' + result['uyari'])
         if command == 'kisayol':
             return '\n'.join(lines)
         if result.get('onceki_klasorde_kalan'):
@@ -1710,6 +1994,8 @@ def main(argv=None, vault=None, state=None):
     command = args.command or 'pencere'
     as_json = args.force_json or not sys.stdout or not sys.stdout.isatty()
     if command == 'pencere':
+        if argv is None and sys.platform.startswith('linux'):
+            _hand_over(vault, state)  # started by the hotkey from the state copy
         context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
         result = popup(vault, context, state)
     elif command == 'dinle':

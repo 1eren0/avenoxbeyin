@@ -3,9 +3,13 @@
 Offline: `isle` runs with every helper tool hidden, so nothing reaches the network and the
 popup/hotkey paths are never started.
 """
+import ast
+import io
 import json
 import os
 from pathlib import Path
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -19,6 +23,54 @@ SCRIPTS = ROOT / 'template/.claude/scripts'
 INBOX = '📥 000-Inbox/Yakala'
 sys.path.insert(0, str(SCRIPTS))
 import beyin_v3_yakala as yakala  # noqa: E402
+
+
+def desktop_exec_argv(text):
+    """Arguments of the Exec line, read by the letter of the Desktop Entry spec (written apart from the module).
+
+    Three layers: the string escapes of a key file, the double-quote rules of Exec, then field codes.
+    A sequence the spec does not allow fails here instead of being guessed at.
+    """
+    line = next(item for item in text.split('\n') if item.startswith('Exec='))[5:]
+    value, index = '', 0
+    while index < len(line):
+        if line[index] == '\\':
+            value += {'s': ' ', 'n': '\n', 't': '\t', 'r': '\r', '\\': '\\'}[line[index + 1]]
+            index += 2
+        else:
+            value += line[index]
+            index += 1
+    args, current, quoted, open_arg, index = [], '', False, False, 0
+    while index < len(value):
+        char = value[index]
+        if quoted:
+            if char == '\\':
+                assert value[index + 1] in '"`$\\', 'only " ` $ and \\ may follow a backslash: ' + value
+                current += value[index + 1]
+                index += 1
+            elif char == '"':
+                quoted = False
+            else:
+                assert char not in '`$', 'unescaped ' + char + ' inside quotes: ' + value
+                current += char
+        elif char == '"':
+            assert not open_arg, 'an argument is quoted in whole: ' + value
+            quoted = open_arg = True
+        elif char == ' ':
+            if open_arg:
+                args.append(current)
+            current, open_arg = '', False
+        else:
+            assert not re.match(r'[\s"\'\\><~|&;$*?#()`]', char), 'reserved character outside quotes: ' + value
+            current += char
+            open_arg = True
+        index += 1
+    assert not quoted, 'unterminated quote: ' + value
+    if open_arg:
+        args.append(current)
+    for arg in args:
+        assert '%' not in arg.replace('%%', ''), 'a lone % is a field code: ' + arg
+    return [arg.replace('%%', '%') for arg in args]
 
 
 class YakalaUnitTest(unittest.TestCase):
@@ -281,6 +333,457 @@ class YakalaUnitTest(unittest.TestCase):
         run.assert_not_called()
         self.assertTrue(agent.exists())
         self.assertNotIn('LaunchAgent', result['kaldirilan'])
+
+    def test_linux_hotkey_specs(self):
+        self.assertEqual(yakala.linux_hotkey('ctrl+alt+b'), ('Ctrl+Alt+B', 201326658, '<Control><Alt>b', 'Ctrl+Alt+B'))
+        self.assertEqual(yakala.linux_hotkey('ctrl+shift+f5'), ('Ctrl+Shift+F5', 0x04000000 + 0x02000000 + 0x01000034,
+                                                                '<Control><Shift>F5', 'Ctrl+Shift+F5'))
+        self.assertEqual(yakala.linux_hotkey('super+space'), ('Meta+Space', 0x10000020, '<Super>space', 'Super+Space'))
+        for bad in ('shift+b', 'ctrl+f13', 'ctrl+"', 'ctrl+enter', 'f5'):
+            with self.assertRaises(ValueError):
+                yakala.linux_hotkey(bad)
+
+    def _linux_env(self, desktop, gnome_list="@as []"):
+        """Patched Linux session: records every external call, answers the few the code reads.
+
+        `self.linux_faults` maps a tool name to an exception to raise or an exit code; names in
+        `self.linux_missing` are not on PATH. The stand-in `gsettings set` follows gsettings-tool.c:
+        the value is GVariant text, and only a string that does not start with a quote may be bare.
+        """
+        home = Path(self.tmp.name) / 'home'
+        calls = []
+        self.linux_options, self.linux_faults, self.linux_missing, self.gnome_keys = [], {}, set(), {}
+        self.kde_key_owner = "([(['beyne-at.desktop', '_launch'], [201326658])],)"
+
+        def fake_run(command, **kwargs):
+            command = [str(part) for part in command]
+            calls.append(command)
+            self.linux_options.append(kwargs)
+            fault = self.linux_faults.get(Path(command[0]).name)
+            if isinstance(fault, BaseException):
+                raise fault
+            out, code = '', fault or 0
+            if code:
+                pass
+            elif command[:3] == ['gsettings', 'get', yakala.GNOME_KEYS]:
+                out = self.gnome_list
+            elif command[:2] == ['gsettings', 'set']:
+                try:
+                    value = ast.literal_eval(command[4])
+                except (ValueError, SyntaxError):
+                    value = None if command[3] == 'custom-keybindings' or command[4][:1] in ('"', "'") else command[4]
+                if value is None:
+                    code = 1
+                elif command[3] == 'custom-keybindings':
+                    self.gnome_list = repr(value) if value else '@as []'
+                else:
+                    self.gnome_keys[command[3]] = value
+            elif command[-1] == 'org.kde.kglobalaccel.Component.isActive':
+                out = '(true,)'
+            elif command[-1] == '201326658':
+                out = self.kde_key_owner
+            return subprocess.CompletedProcess(command, code, out.encode(), b'')
+        self.gnome_list = gnome_list
+        patches = [patch.object(yakala.sys, 'platform', 'linux'), patch.object(yakala.subprocess, 'run', fake_run),
+                   patch.object(yakala, '_which', lambda *names: next(('/usr/bin/' + name for name in names
+                                                                       if name not in self.linux_missing), None)),
+                   patch.dict(yakala.os.environ, {'HOME': str(home), 'XDG_DATA_HOME': str(home / 'data'),
+                                                  'XDG_CURRENT_DESKTOP': desktop})]
+        for item in patches:
+            item.start()
+            self.addCleanup(item.stop)
+        return home / 'data/applications/beyne-at.desktop', calls
+
+    def _linux_argv(self, state):
+        """The command `kur` binds on Linux: this Python, the state copy, the window, this vault."""
+        return [sys.executable, str(Path(state).resolve() / 'yakala' / 'beyin_v3_yakala.py'), 'pencere',
+                '--vault', str(self.vault.resolve())]
+
+    def test_linux_install_kde_and_uninstall(self):
+        entry, calls = self._linux_env('KDE')
+        state = Path(self.tmp.name) / 'state'
+        done = yakala.install(self.vault, state, spec='ctrl+alt+b')
+        self.assertEqual((done['kisayol'], done['kisayol_calisiyor']), ('Ctrl+Alt+B', True))
+        # Read back through the spec instead of searching the escaped text: holds for any path, Windows ones too.
+        self.assertEqual(desktop_exec_argv(entry.read_text(encoding='utf-8')), self._linux_argv(state))
+        self.assertEqual(yakala._desktop_owner(entry), str(self.vault.resolve()))
+        self.assertTrue(Path(self._linux_argv(state)[1]).is_file())
+        write = next(c for c in calls if 'kwriteconfig' in c[0])
+        for part in ('services', 'beyne-at.desktop', '_launch', 'Ctrl+Alt+B'):
+            self.assertIn(part, write)
+        keys = next(c for c in calls if 'org.kde.KGlobalAccel.setShortcutKeys' in c)
+        self.assertEqual(keys[-2:], ['[([201326658],)]', '6'])
+        self.assertTrue(yakala.status(self.vault, state)['dinleyici_calisiyor'])
+        removed = yakala.uninstall(self.vault, state)['kaldirilan']
+        self.assertIn('beyne-at.desktop', removed)
+        self.assertFalse(entry.exists())
+        self.assertTrue(any('--delete' in c for c in calls))
+        self.assertTrue(any('org.kde.KGlobalAccel.unregister' in c for c in calls))
+        self.assertFalse(Path(self._linux_argv(state)[1]).exists())
+        # No call can hang the command or reach a shell.
+        self.assertTrue(all(options.get('timeout') and not options.get('shell') for options in self.linux_options))
+
+    def test_linux_install_gnome_keeps_existing_bindings(self):
+        entry, calls = self._linux_env('ubuntu:GNOME', "['/org/other/custom0/']")
+        state = Path(self.tmp.name) / 'state'
+        for _ in range(2):
+            self.assertEqual(yakala.install(self.vault, state)['kisayol'], 'Ctrl+Alt+B')
+        self.assertEqual(yakala._gnome_list(), ['/org/other/custom0/', yakala.GNOME_PATH])
+        self.assertEqual((self.gnome_keys['name'], self.gnome_keys['binding']), ('Beyne at', '<Control><Alt>b'))
+        self.assertEqual(shlex.split(self.gnome_keys['command']), self._linux_argv(state))
+        self.assertEqual(len([c for c in calls if c[:2] == ['gsettings', 'set'] and c[3] == 'custom-keybindings']), 1)
+        yakala.uninstall(self.vault, state)
+        self.assertEqual(yakala._gnome_list(), ['/org/other/custom0/'])
+        self.assertFalse(entry.exists())
+
+    def test_linux_install_other_desktop_gives_hint(self):
+        entry, _ = self._linux_env('XFCE')
+        done = yakala.install(self.vault, Path(self.tmp.name) / 'state')
+        self.assertIsNone(done['kisayol'])
+        self.assertIn('pencere --vault', done['ipucu'])
+        self.assertEqual(shlex.split(done['ipucu'].split(': ', 1)[1]), self._linux_argv(Path(self.tmp.name) / 'state'))
+        self.assertNotIn('kisayol_calisiyor', done)
+        self.assertTrue(entry.is_file())
+        self.assertIn(done['ipucu'], yakala.human(done, 'kur'))
+
+    def test_desktop_exec_quotes_spaces(self):
+        self.assertEqual(yakala._desktop_quote('/tmp/a b/x'), '"/tmp/a b/x"')
+        self.assertEqual(yakala._desktop_quote('/tmp/x'), '/tmp/x')
+
+    def test_linux_fallback_saves_clipboard_text_with_reason(self):
+        with patch.object(yakala.sys, 'platform', 'linux'), patch.object(yakala, '_which', lambda *n: '/usr/bin/' + n[0]), \
+                patch.object(yakala, '_try', return_value=(0, 'tek satir neden\n')) as ask:
+            result = yakala._popup_fallback(self.vault, {'metin': 'kopyalanan paragraf'})
+        self.assertEqual(ask.call_args[0][0][0], '/usr/bin/kdialog')
+        self.assertIn('kopyalanan paragraf', ask.call_args[0][0][4])
+        self.assertEqual(result['status'], 'yakalandi')
+        card = yakala.cards(self.vault)[0]
+        self.assertIn('kopyalanan paragraf', card['body'])
+        self.assertIn('tek satir neden', card['body'])
+
+    def test_linux_fallback_cancel(self):
+        with patch.object(yakala.sys, 'platform', 'linux'), patch.object(yakala, '_which', lambda *n: '/usr/bin/' + n[0]), \
+                patch.object(yakala, '_try', return_value=(1, '')):
+            self.assertEqual(yakala._popup_fallback(self.vault, {'metin': 'x'}), {'status': 'vazgecildi'})
+        self.assertEqual(yakala.cards(self.vault), [])
+
+    def _linux_context(self, clip, code=0, wayland=True, missing=()):
+        """gather_context() on Linux; `clip` is what the clipboard helper prints. -> (context, commands run)."""
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, code, clip if isinstance(clip, bytes) else clip.encode('utf-8'), b'')
+        with patch.object(yakala.sys, 'platform', 'linux'), patch.dict(yakala.os.environ, {'WAYLAND_DISPLAY': 'wayland-0'}), \
+                patch.object(yakala, '_which', lambda *names: next(('/usr/bin/' + n for n in names if n not in missing), None)), \
+                patch.object(yakala.subprocess, 'run', run):
+            if not wayland:
+                del yakala.os.environ['WAYLAND_DISPLAY']
+            return yakala.gather_context(), commands
+
+    def test_linux_context_reads_clipboard(self):
+        def context(clip):
+            return self._linux_context(clip)[0]
+        self.assertEqual(context('https://ornek.com/a\n'), {'url': 'https://ornek.com/a'})
+        # A link with more lines is text, as in the window on macOS and Windows; the second line is not dropped.
+        self.assertEqual(context('https://ornek.com/a\nikinci'), {'metin': 'https://ornek.com/a\nikinci'})
+        self.assertEqual(context('duz metin'), {'metin': 'duz metin'})
+        self.assertEqual(context('  \n'), {})
+
+    def test_linux_context_classifies_like_the_window(self):
+        for clip in ('https://ornek.com/a', ' https://ornek.com/a?x=1&y=2#z \n', 'https://ornek.com/a b', 'http://x',
+                     'https://a.com\nhttps://b.com', 'bak: https://ornek.com', 'ftp://x/y', 'Şifre: İstanbul ığ'):
+            window_takes_it_as_link = bool(re.match(r'^https?://\S+$', clip.strip()))  # the rule in popup()
+            context = self._linux_context(clip)[0]
+            self.assertEqual('url' in context, window_takes_it_as_link, clip)
+            self.assertEqual(context.get('url') or context.get('metin'), clip.strip(), clip)
+
+    def test_linux_context_reads_through_one_helper(self):
+        text = ['-o', '-selection', 'clipboard']
+        self.assertEqual(self._linux_context('duz')[1], [['/usr/bin/wl-paste', '--no-newline', '--type', 'text']])
+        # Only an image copied: wl-paste --type text exits 1. Nothing is taken; image bytes never become a note.
+        self.assertEqual(self._linux_context(b'\x89PNG\r\n\x1a\n\x00\x00', code=1)[0], {})
+        self.assertEqual(self._linux_context('duz', wayland=False)[1], [['/usr/bin/xclip'] + text])
+        self.assertEqual(self._linux_context('duz', missing=('wl-paste',))[1], [['/usr/bin/xclip'] + text])
+        self.assertEqual(self._linux_context('duz', wayland=False, missing=('xclip',))[1], [['/usr/bin/xsel', '-ob']])
+        self.assertEqual(self._linux_context('duz', wayland=False, missing=('xclip', 'xsel')), ({}, []))
+        self.assertEqual(self._linux_context(b'caf\xe9 \xff')[0], {'metin': 'caf\ufffd \ufffd'})
+        capped = self._linux_context(b'a' * (yakala.CLIP_LIMIT + 10))[0]['metin']
+        self.assertEqual(capped, 'a' * yakala.CLIP_LIMIT + yakala.CLIP_CUT)
+
+    def test_file_uri_paths(self):
+        path = yakala._file_uri_path
+        self.assertEqual(path('file:///home/a/not.txt'), '/home/a/not.txt')
+        self.assertEqual(path('file:///home/a/a%20b/%C5%9Eifre%20%C4%B1%C4%9F%20%C4%B0.pdf'), '/home/a/a b/Şifre ığ İ.pdf')
+        self.assertEqual(path('file:///tmp/%2550%23x%3Fy'), '/tmp/%50#x?y')  # decoded once, not twice
+        self.assertEqual(path('file://localhost/tmp/x'), '/tmp/x')
+        self.assertEqual(path('file:///tmp/a#b?c'), '/tmp/a#b?c')
+        for other in ('file://baska-makine/etc/hosts', 'file:/tmp/x', 'file://', 'https://ornek.com/x', '/tmp/x',
+                      'bak file:///tmp/x', ''):
+            self.assertIsNone(path(other), other)
+
+    @unittest.skipUnless(os.name == 'posix', 'a Linux file manager copies POSIX paths')
+    def test_linux_context_copied_files(self):
+        def context(clip):
+            return self._linux_context(clip)[0]
+        folder = Path(self.tmp.name).resolve()
+        first, second = folder / 'a b.txt', folder / 'Şifre ığ %50.pdf'
+        for item in (first, second):
+            item.write_text('x', encoding='utf-8')
+        gone = (folder / 'yok.txt').as_uri()
+        self.assertEqual(context(first.as_uri() + '\n'), {'dosyalar': [str(first)]})
+        # A text/uri-list as file managers write it: CRLF lines, a comment, one file that no longer exists.
+        listing = '# kopyalanan dosyalar\r\n' + '\r\n'.join((first.as_uri(), gone, second.as_uri())) + '\r\n'
+        self.assertEqual(context(listing), {'dosyalar': [str(first), str(second)]})
+        self.assertEqual(context(gone), {})
+        self.assertEqual(context(folder.as_uri()), {})  # a folder is not a file to copy into the vault
+        self.assertEqual(context('file:///tmp/a%00b'), {})
+        self.assertEqual(len(context('\n'.join([first.as_uri()] * 30))['dosyalar']), 20)
+        # Not a list of local files: a URI of another machine, files mixed with text, a comment alone.
+        remote = 'file://baska-makine' + first.as_uri()[7:]
+        self.assertEqual(context(remote), {'metin': remote})
+        mixed = first.as_uri() + '\nbir not'
+        self.assertEqual(context(mixed), {'metin': mixed})
+        self.assertEqual(context('# yalniz yorum'), {'metin': '# yalniz yorum'})
+
+    def _linux_fallback(self, context, answer=(0, 'neden\n'), tools=('kdialog', 'zenity')):
+        """The no-tkinter window on Linux. -> (result, dialog command or None)."""
+        with patch.object(yakala.sys, 'platform', 'linux'), patch.object(yakala, '_try', return_value=answer) as ask, \
+                patch.object(yakala, '_which', lambda *names: next(('/usr/bin/' + n for n in names if n in tools), None)):
+            result = yakala._popup_fallback(self.vault, context)
+        return result, (ask.call_args[0][0] if ask.called else None)
+
+    def test_linux_dialog_never_takes_clipboard_text_as_an_option(self):
+        hostile = '--password\x00 <b>kalin</b> a_b C:\\new\\tab\n--geticon ' + 'x' * 300
+        shown = ('--password  <b>kalin</b> a_b C:\\new\\tab --geticon ' + 'x' * 300)[:120].replace('\\', '\\\\')
+        _, kdialog = self._linux_fallback({'metin': hostile})
+        self.assertEqual(kdialog, ['/usr/bin/kdialog', '--title', 'Beyne at', '--inputbox', 'Neden kaydediyorsun?\n' + shown, ''])
+        _, zenity = self._linux_fallback({'metin': hostile}, tools=('zenity',))
+        self.assertEqual(zenity, ['/usr/bin/zenity', '--entry', '--title', 'Beyne at', '--text',
+                                  'Neden kaydediyorsun?\n' + shown.replace('_', '__')])
+        for command, ours in ((kdialog, ['--title', '--inputbox']), (zenity, ['--entry', '--title', '--text'])):
+            self.assertEqual([part for part in command if part.startswith('-')], ours)
+            # One fixed first line, then the clipboard on one line: it cannot add an argument, a line or markup of its own.
+            self.assertEqual(command[4 if command is kdialog else 5].split('\n')[0], 'Neden kaydediyorsun?')
+            self.assertEqual(sum(part.count('\n') for part in command), 1)
+            self.assertFalse(any('\x00' in part for part in command))
+        # The whole clipboard text is what gets saved, not the shortened line the dialog shows.
+        self.assertIn('x' * 300, yakala.cards(self.vault)[0]['body'])
+        self.assertEqual(self._linux_fallback({})[1][4], 'Neden kaydediyorsun?')
+
+    def test_linux_dialog_cancel_empty_answer_and_typed_note(self):
+        for answer in ((1, ''), (5, ''), (None, '')):  # Cancel, zenity timeout, the tool hung or vanished
+            self.assertEqual(self._linux_fallback({'url': 'https://ornek.com/a'}, answer)[0], {'status': 'vazgecildi'})
+        self.assertEqual(self._linux_fallback({}, (0, '\n'))[0], {'status': 'vazgecildi'})  # nothing copied, nothing typed
+        self.assertEqual(yakala.cards(self.vault), [])
+        self.assertEqual(self._linux_fallback({'url': 'https://ornek.com/a'}, (0, '\n'))[0]['status'], 'yakalandi')
+        typed = self._linux_fallback({}, (0, 'yalnız yazılan not\n'))[0]
+        self.assertEqual(typed['kaynak_turu'], 'metin')
+        self.assertIn('yalnız yazılan not', yakala.find_card(self.vault, typed['id'])['body'])
+
+    def test_linux_without_any_window_nothing_is_saved_unseen(self):
+        with self.assertRaises(ValueError) as error:
+            self._linux_fallback({'metin': 'panodaki gizli metin'}, tools=())
+        self.assertEqual(str(error.exception), yakala.LINUX_NO_WINDOW)
+        for word in ('tkinter', 'kdialog', 'zenity'):
+            self.assertIn(word, yakala.LINUX_NO_WINDOW)
+        self.assertEqual(yakala.cards(self.vault), [])
+        self.assertFalse((self.vault / INBOX).exists())
+
+    def test_fallback_on_other_systems_never_opens_a_linux_dialog(self):
+        with patch.object(yakala, '_linux_ask', side_effect=AssertionError('Linux dialog')), \
+                patch.object(yakala, '_osascript', return_value='mac nedeni') as mac:
+            with patch.object(yakala.sys, 'platform', 'darwin'):
+                saved = yakala._popup_fallback(self.vault, {'url': 'https://ornek.com/mac', 'baslik': 'Başlık', 'uygulama': 'Safari'})
+            with patch.object(yakala.sys, 'platform', 'win32'):
+                self.assertEqual(yakala._popup_fallback(self.vault, {'uygulama': 'notepad'}), {'status': 'vazgecildi'})
+        mac.assert_called_once()
+        card = yakala.find_card(self.vault, saved['id'])
+        self.assertEqual((card['meta']['url'], card['meta']['baslik'], card['meta']['uygulama']),
+                         ('https://ornek.com/mac', 'Başlık', 'Safari'))
+        self.assertIn('mac nedeni', card['body'])
+
+    def test_desktop_entry_round_trips_any_vault_path(self):
+        vaults = ['/home/ayşe/İkinci Beyin', '/home/u/📥 Beyin', '/home/u/100% Beyin %U %%f', '/home/u/$HOME `id` $(id)',
+                  '/home/u/"çift" \'tek\' tırnak', '/home/u/ters\\bölü\\', '/home/u/satır\nsonu\tsekme\rdönüş',
+                  '/home/u/a\u2028b\x85c', 'C:\\Users\\Ayşe\\İkinci Beyin', '/home/u/sade',
+                  '/home/u/Ş ğ ü ç ö ı İ 📥 100% $x "q" \\ `b` ~ * ? # ( ) < > | & ; =']
+        entry = Path(self.tmp.name) / 'beyne-at.desktop'
+        for vault in vaults:
+            argv = ['/usr/bin/python3', vault + '/durum/beyin_v3_yakala.py', 'pencere', '--vault', vault]
+            text = yakala._desktop_entry(argv, vault)
+            self.assertEqual(desktop_exec_argv(text), argv, vault)
+            lines = text.split('\n')  # a path cannot add a line, so it cannot add a key
+            self.assertEqual([line.split('=')[0] for line in lines], ['[Desktop Entry]', 'Type', 'Name', 'Comment', 'Exec',
+                                                                     'Terminal', 'Categories', 'X-Beyin-Vault', ''], vault)
+            entry.write_text(text, encoding='utf-8', newline='\n')
+            self.assertEqual(yakala._desktop_owner(entry), vault)
+        self.assertEqual(yakala._desktop_quote(''), '""')
+        self.assertEqual(yakala._desktop_quote('100%'), '"100%%"')
+        self.assertEqual(yakala._desktop_quote('a$b\\c'), '"a\\\\$b\\\\\\\\c"')  # \$ and \\ per Exec, then each backslash doubled
+
+    def test_desktop_owner_of_a_missing_or_foreign_file(self):
+        entry = Path(self.tmp.name) / 'beyne-at.desktop'
+        self.assertIsNone(yakala._desktop_owner(entry))
+        entry.write_bytes(b'[Desktop Entry]\nName=caf\xe9\nX-Beyin-Vault=/x\n')  # not UTF-8: not written by kur
+        self.assertIsNone(yakala._desktop_owner(entry))
+        entry.write_text('[Desktop Entry]\nName=Baska\n', encoding='utf-8')
+        self.assertIsNone(yakala._desktop_owner(entry))
+
+    def test_desktop_file_ignores_a_relative_xdg_data_home(self):
+        home = Path(self.tmp.name) / 'home'
+        default = home / '.local/share/applications/beyne-at.desktop'
+        absolute = Path(self.tmp.name).resolve() / 'veri'
+        with patch.object(yakala.Path, 'home', return_value=home), patch.dict(yakala.os.environ):
+            for value in ('goreli/veri', '.', ''):
+                yakala.os.environ['XDG_DATA_HOME'] = value
+                self.assertEqual(yakala._desktop_file(), default, value)
+            del yakala.os.environ['XDG_DATA_HOME']
+            self.assertEqual(yakala._desktop_file(), default)
+            yakala.os.environ['XDG_DATA_HOME'] = str(absolute)
+            self.assertEqual(yakala._desktop_file(), absolute / 'applications/beyne-at.desktop')
+
+    def test_linux_kde_failures_degrade_to_the_hint(self):
+        entry, calls = self._linux_env('KDE')
+        state = Path(self.tmp.name) / 'state'
+
+        def failed():
+            done = yakala.install(self.vault, state)
+            self.assertIs(done['kisayol_calisiyor'], False)  # never reported as working when the check did not pass
+            self.assertEqual(shlex.split(done['ipucu'].split(': ', 1)[1]), self._linux_argv(state))
+            self.assertIn(done['ipucu'], yakala.human(done, 'kur'))
+            self.assertIn('UYARI', yakala.human(done, 'kur'))
+            self.assertTrue(entry.is_file())
+            return done
+        for fault in (FileNotFoundError(2, 'gdbus yok'), subprocess.TimeoutExpired(['gdbus'], 5), 1):
+            self.linux_faults = {'gdbus': fault}
+            failed()
+            self.assertIs(yakala.status(self.vault, state)['dinleyici_calisiyor'], False)
+        self.linux_faults = {'kwriteconfig6': 1}
+        failed()
+        self.linux_faults, self.linux_missing = {}, {'kwriteconfig6', 'kwriteconfig5'}
+        failed()
+        self.linux_missing = {'kwriteconfig6'}  # Plasma 5 name
+        self.assertIs(yakala.install(self.vault, state)['kisayol_calisiyor'], True)
+        self.assertIn('/usr/bin/kwriteconfig5', [c[0] for c in calls])
+        # The key answers, but for another program: registered is not the same as ours.
+        self.linux_missing, self.kde_key_owner = set(), "([('kwin', 'KWin', 'kwin', 'KWin', 'x', 'X', [201326658], [0])],)"
+        failed()
+        self.assertTrue(all(options.get('timeout') and not options.get('shell') for options in self.linux_options))
+
+    def test_gnome_list_parsing(self):
+        cases = {'@as []': [], '[]': [], "['/a/', '/b/']": ['/a/', '/b/'], '["/it\'s/"]': ["/it's/"],
+                 "['/ş/']": ['/ş/'], '': None, 'bozuk': None, "'/a/'": None, '[1, 2]': None, "['/a/', 2]": None,
+                 "{'a': 1}": None, "('/a/',)": None, '[' * 300: None}
+        for text, expected in cases.items():
+            with patch.object(yakala, '_try', return_value=(0, text + '\n')):
+                self.assertEqual(yakala._gnome_list(), expected, text[:20])
+        for answer in ((1, ''), (None, '')):
+            with patch.object(yakala, '_try', return_value=answer):
+                self.assertIsNone(yakala._gnome_list())
+        self.assertEqual(yakala._gvariant("it's a \\ path"), "'it\\'s a \\\\ path'")
+        self.assertEqual(ast.literal_eval(yakala._gvariant('/opt/my py\'s/"x" \\ Ş')), '/opt/my py\'s/"x" \\ Ş')
+
+    def test_linux_gnome_first_and_only_binding(self):
+        entry, calls = self._linux_env('GNOME')  # "@as []": gsettings prints an empty list with its type
+        state = Path(self.tmp.name) / 'state'
+        self.assertIs(yakala.install(self.vault, state)['kisayol_calisiyor'], True)
+        self.assertEqual(self.gnome_list, repr([yakala.GNOME_PATH]))
+        self.assertIs(yakala.status(self.vault, state)['dinleyici_calisiyor'], True)
+        yakala.uninstall(self.vault, state)
+        self.assertEqual(self.gnome_list, '@as []')
+        self.assertIn(['gsettings', 'reset-recursively', yakala._gnome_schema()], calls)
+        self.assertIsNone(yakala.status(self.vault, state)['dinleyici_calisiyor'])
+        self.assertTrue(all(options.get('timeout') and not options.get('shell') for options in self.linux_options))
+
+    def test_linux_gnome_unreadable_list_changes_nothing(self):
+        entry, calls = self._linux_env('GNOME', "['/org/other/custom0/', 7]")
+        done = yakala.install(self.vault, Path(self.tmp.name) / 'state')
+        self.assertIs(done['kisayol_calisiyor'], False)
+        self.assertIn('pencere --vault', done['ipucu'])
+        self.assertFalse([c for c in calls if c[:2] == ['gsettings', 'set']])
+        self.assertEqual(self.gnome_list, "['/org/other/custom0/', 7]")
+
+    def test_linux_gnome_command_survives_a_python_path_with_quotes(self):
+        entry, calls = self._linux_env('GNOME', "['/org/other/custom0/']")
+        state = Path(self.tmp.name) / 'state'
+        with patch.object(yakala.sys, 'executable', "/opt/my py's/100% \"python\""):
+            done = yakala.install(self.vault, state)
+            argv = self._linux_argv(state)
+        self.assertIs(done['kisayol_calisiyor'], True)
+        self.assertEqual(shlex.split(self.gnome_keys['command']), argv)
+        self.assertEqual(desktop_exec_argv(entry.read_text(encoding='utf-8')), argv)
+        self.assertEqual(yakala._gnome_list(), ['/org/other/custom0/', yakala.GNOME_PATH])
+
+    def test_linux_entry_of_another_vault_is_left_alone(self):
+        entry, calls = self._linux_env('KDE')
+        state = Path(self.tmp.name) / 'state'
+        other = '/home/baska/Diğer Beyin'
+        entry.parent.mkdir(parents=True)
+        entry.write_text(yakala._desktop_entry(['python3', 'x.py', 'pencere', '--vault', other], other), encoding='utf-8', newline='\n')
+        before = entry.read_bytes()
+        self.assertIsNone(yakala.status(self.vault, state)['dinleyici_calisiyor'])
+        self.assertNotIn('beyne-at.desktop', yakala.uninstall(self.vault, state)['kaldirilan'])
+        self.assertEqual((entry.read_bytes(), calls), (before, []))
+        done = yakala.install(self.vault, state)  # like macOS: the one hotkey moves to this vault and says so
+        self.assertEqual(done['onceki_vault'], other)
+        self.assertEqual(yakala._desktop_owner(entry), str(self.vault.resolve()))
+        mine = entry.read_bytes()
+        again = yakala.install(self.vault, state)
+        self.assertNotIn('onceki_vault', again)
+        self.assertEqual((entry.read_bytes(), again['kisayol_calisiyor']), (mine, True))
+        self.assertNotIn(b'\r', mine)
+
+    def test_linux_install_warns_when_no_window_can_open(self):
+        self._linux_env('KDE')
+        state = Path(self.tmp.name) / 'state'
+        with patch.dict(sys.modules, {'tkinter': None}):  # import tkinter fails, as on Arch without the tk package
+            self.assertNotIn('uyari', yakala.install(self.vault, state))  # kdialog is there
+            self.linux_missing = {'kdialog'}
+            self.assertNotIn('uyari', yakala.install(self.vault, state))  # zenity is there
+            self.linux_missing = {'kdialog', 'zenity'}
+            done = yakala.install(self.vault, state)
+        self.assertEqual(done['uyari'], yakala.LINUX_NO_WINDOW)
+        self.assertIn('UYARI: ' + yakala.LINUX_NO_WINDOW, yakala.human(done, 'kur'))
+
+    def test_linux_state_copy_hands_over_to_the_vault_module(self):
+        state = Path(self.tmp.name) / 'state'
+        runner = state / 'yakala' / 'beyin_v3_yakala.py'
+        current = self.vault / '.claude/scripts/beyin_v3_yakala.py'
+        runner.parent.mkdir(parents=True)
+        runner.write_text('# kopya\n', encoding='utf-8')
+        argv = ['x', 'pencere', '--vault', str(self.vault)]
+        with patch.object(yakala.os, 'execv') as execv, patch.object(yakala.sys, 'argv', argv):
+            with patch.object(yakala, '__file__', str(runner)):
+                yakala._hand_over(self.vault, state)  # the vault has no module of its own: the copy keeps running
+                execv.assert_not_called()
+                current.parent.mkdir(parents=True)
+                current.write_text('# guncel\n', encoding='utf-8')
+                yakala._hand_over(self.vault, state)
+                execv.assert_called_once_with(sys.executable, [sys.executable, str(current)] + argv[1:])
+                execv.side_effect = OSError('exec')
+                yakala._hand_over(self.vault, state)  # cannot start it: the copy still opens the window
+            execv.reset_mock(side_effect=True)
+            with patch.object(yakala, '__file__', str(current)):
+                yakala._hand_over(self.vault, state)  # already the vault module
+            yakala._hand_over(self.vault, state)  # run from the package, as these tests do
+            execv.assert_not_called()
+
+    def test_hand_over_only_for_the_linux_hotkey_process(self):
+        argv = ['x', 'pencere', '--vault', str(self.vault)]
+        with patch.object(yakala, '_hand_over') as hand, patch.object(yakala, 'gather_context', return_value={}), \
+                patch.object(yakala, 'popup', return_value={'status': 'vazgecildi'}), \
+                patch.object(yakala.sys, 'argv', argv), patch('sys.stdout', new_callable=io.StringIO):
+            for platform in ('darwin', 'win32'):
+                with patch.object(yakala.sys, 'platform', platform):
+                    yakala.main()
+            with patch.object(yakala.sys, 'platform', 'linux'):
+                yakala.main(argv[1:])  # through beyin.py: already the vault module
+                yakala.main(['liste', '--vault', str(self.vault)])
+                hand.assert_not_called()
+                yakala.main()
+        hand.assert_called_once()
+        self.assertEqual(hand.call_args[0][0], self.vault.resolve())
 
     def test_mac_install_plist_keepalive(self):
         state = Path(self.tmp.name) / 'mac-state'
@@ -664,6 +1167,28 @@ class YakalaInstalledTest(unittest.TestCase):
         self.assertIsInstance(yakala.windows_context(), dict)
         self.entry('kaldir')
         self.assertFalse(start.exists() or sendto.exists())
+
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux desktop entry and the command to bind')
+    def test_linux_desktop_entry_and_hint(self):
+        # A desktop that is neither KDE nor GNOME: nothing is registered, so no session is touched.
+        data = Path(self.tmp.name) / 'veri'
+        self.env = dict(self.env, XDG_DATA_HOME=str(data), XDG_CURRENT_DESKTOP='yakala-test')
+        installed = self.entry('kur')
+        self.assertIsNone(installed['kisayol'])
+        entry = data / 'applications/beyne-at.desktop'
+        argv = desktop_exec_argv(entry.read_text(encoding='utf-8'))
+        self.assertEqual(argv[2:], ['pencere', '--vault', str(self.vault.resolve())])
+        self.assertEqual(shlex.split(installed['ipucu'].split(': ', 1)[1]), argv)
+        runner = Path(argv[1])
+        self.assertEqual((runner.parent.name, runner.is_file()), ('yakala', True))
+        self.assertIn(self.state.resolve(), runner.resolve().parents)
+        # The entry names a Python and a module that start: same command, a read-only subcommand in place of the window.
+        listed = subprocess.run(argv[:2] + ['liste', '--json'] + argv[3:], capture_output=True, text=True, encoding='utf-8',
+                                env=self.env, timeout=60)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIsNone(self.entry('durum')['dinleyici_calisiyor'])
+        self.assertIn('beyne-at.desktop', self.entry('kaldir')['kaldirilan'])
+        self.assertFalse(entry.exists() or runner.exists())
 
     def test_user_skill_with_same_name_is_kept(self):
         own = self.vault / '.agents/skills/beyin-yakala/SKILL.md'
