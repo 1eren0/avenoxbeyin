@@ -201,6 +201,20 @@ class UserListTest(EngineFixture):
         self.assertFalse((self.vault / 'tasks').exists())
         self.assertEqual(self.engine.note_create('knowledge/yeni.md', 'Nebula calibration created note.')['status'], 'succeeded')
 
+    def test_a_listed_built_in_name_prunes_nothing_not_even_its_turkish_spelling(self):
+        # The walk's own rule does not take RECE\u0130PTS for receipts; the list's Turkish folding
+        # would. What the list prunes and what the receipt readers withhold must be one set, and
+        # receipts cannot be in it, so a listed built-in name is a no-op here as well.
+        folder = 'RECE\u0130PTS'
+        self.config({'excluded_dirs': ['receipts', '.gizli']})
+        self.note(folder + '/fis.md', 'Nebula calibration user folder.\n')
+        self.note('notlar/gercek.md', 'Nebula calibration real note.\n')
+        result = self.engine.sync()
+        self.assertEqual(self.sources(), [folder + '/fis.md', 'notlar/gercek.md'])
+        self.assertEqual((result['index_exclusions']['excluded_dirs'], result['index_exclusions']['pruned']),
+                         (['receipts', '.gizli'], 0))
+        self.assertEqual(self.engine.excluded_dir_keys, frozenset())
+
     def test_built_in_and_hidden_names_are_harmless_and_receipts_keep_working(self):
         self.config({'excluded_dirs': ['node_modules', 'receipts', '.venv', 'target']})
         self.note('notes/kaynak.md', 'Nebula calibration receipt source.\n')

@@ -569,8 +569,10 @@ class SyncEngine:
         duplicate = set()
         # Read once per sync, not per directory: the config cannot change mid-walk.
         excluded, self.index_exclusions = index_exclusions(self.state, self.root)
-        # project_receipts stores these in this sync's transaction for the receipt readers.
-        self.excluded_dir_keys = applied_keys(excluded, EXCLUDED_DIRS)
+        # A listed name the walk skips anyway is a no-op. One set prunes below and is stored by
+        # project_receipts in this sync's transaction, so the receipt readers withhold exactly
+        # what the list took out of the index.
+        excluded = self.excluded_dir_keys = applied_keys(excluded, EXCLUDED_DIRS)
         for directory, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.casefold() not in EXCLUDED_DIRS and not (Path(directory) / d).is_symlink())
             if excluded:
