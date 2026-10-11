@@ -135,6 +135,32 @@ class HookDoneLedgerTest(unittest.TestCase):
         self.assertEqual(hook.enqueue_event(self.vault, self.state, payload, "claude"), key)
         self.assertEqual(list((self.state / "hook-queue").glob("*.json")), [])
 
+    def test_actual_queue_drain_and_late_replay(self):
+        from beyin_v3_sync import SyncEngine
+        note = self.vault / "notes/task.md"
+        note.parent.mkdir()
+        note.write_text('---\\n' + json.dumps({
+            "id": "task", "kind": "task", "revision": 1,
+            "status": "active", "visibility": "internal"
+        }) + '\\n---\\nSynthetic task body.\\n', encoding="utf-8")
+        engine = SyncEngine(self.vault, self.state)
+        engine.sync()
+        payload = {"event_id": "e2e-replay", "session_id": "synthetic",
+                   "hook_event_name": "SessionEnd"}
+        key = hook.enqueue_event(self.vault, self.state, payload, "claude")
+        self.assertEqual(len(list((self.state / "hook-queue").glob("*.json"))), 1)
+        result = hook.drain_queue(self.vault, self.state)
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["failed"], 0)
+        done_file = self.done / (key + ".json")
+        self.assertTrue(done_file.exists())
+        stamp = time.time() - ledger.RETENTION_SECONDS - 60
+        os.utime(done_file, (stamp, stamp))
+        self.assertEqual(ledger.prune(self.store), 1)
+        self.assertFalse(done_file.exists())
+        self.assertEqual(hook.enqueue_event(self.vault, self.state, payload, "claude"), key)
+        self.assertEqual(list((self.state / "hook-queue").glob("*.json")), [])
+
     def test_doctor_cli_preserves_archived_lifecycle(self):
         self.marker("old-claude", harness="claude", event="SessionStart")
         self.marker("recent-codex", harness="codex", event="Stop", old=False)
