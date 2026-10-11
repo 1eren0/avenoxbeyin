@@ -638,8 +638,8 @@ not knowledge synthesis.
               'companion': companion,
               'update_notice': 'New releases are checked on GitHub at most daily; notes are not sent. Disable with beyin.py preferences --update-notifications off.',
               'skills':{'synced':[s for s in ('beyin','beyin-doktor','beyin-guncelle') if not is_component_excluded(f'.agents/skills/{s}/', user_excluded)],'conflicts':[], 'mode':'managed'}}
-    # V2 flush sentinels whose writer provably died: the cutover went ahead, the summaries they
-    # were writing never reached daily/.
+    # V2 flush sentinels whose writer provably died: the cutover went ahead, and the summaries
+    # they were writing most likely never reached daily/.
     if migration_plan and migration_plan.get('orphaned_legacy_state'):
         result['orphaned_legacy_state'] = migration_plan['orphaned_legacy_state']
     return result

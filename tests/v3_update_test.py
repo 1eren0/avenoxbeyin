@@ -100,19 +100,36 @@ class OfflineUpdateTest(unittest.TestCase):
         self.assertEqual(core.read_bytes(), original)
         self.assertEqual(self.note.read_text(), 'User edit after system update.\n')
 
+    def orphaned_flush(self, name, age=7200):
+        """The record a stock V2 flush leaves when it dies mid-summary, beside its free lock."""
+        legacy = self.vault / '.claude/scripts/.state'
+        legacy.mkdir(parents=True, exist_ok=True)
+        sentinel = legacy / (name + '.json')
+        sentinel.write_bytes(json.dumps({'session_id': name, 'ts': int(time.time()) - age, 'status': 'inflight'}).encode('utf-8'))
+        (legacy / (name + '.lock')).write_bytes(b'')
+        return sentinel
+
     def test_update_reports_a_flush_sentinel_orphaned_after_the_cutover(self):
         # A kept V2 flush that dies mid-summary leaves "inflight" behind. update takes no flags,
         # so a guard that ignored the proof of its own lock stopped every later update here.
-        legacy = self.vault / '.claude/scripts/.state'
-        legacy.mkdir(parents=True, exist_ok=True)
-        sentinel = legacy / 'flush-example.json'
-        sentinel.write_bytes(b'{"status":"inflight"}')
-        (legacy / 'flush-example.lock').write_bytes(b'')
+        sentinel = self.orphaned_flush('flush-example')
+        left = sentinel.read_bytes()
         report = self.module.update(self.vault, self.state, self.package)
         self.assertEqual(report['status'], 'updated')
         self.assertEqual(report['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
         self.assertEqual(self.version(), '3.0.1')
-        self.assertEqual(sentinel.read_bytes(), b'{"status":"inflight"}')
+        self.assertEqual(sentinel.read_bytes(), left)
+
+    def test_update_waits_for_a_recent_flush_sentinel(self):
+        sentinel = self.orphaned_flush('flush-example', age=30)
+        left = sentinel.read_bytes()
+        before = snapshot(self.vault)
+        with self.assertRaisesRegex(RuntimeError, r'flush-example\.json; its lock is free here.*60 minutes old'):
+            self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(self.version(), '3.0.0')
+        self.assertEqual(sentinel.read_bytes(), left)
+        self.assertEqual(snapshot(self.vault), before)
+        self.assertFalse((self.state / 'update-journal.json').exists())
 
     def test_update_message_counts_orphaned_flush_sentinels(self):
         spec = importlib.util.spec_from_file_location('update_test_entry_cli', ROOT / 'scripts/beyin_entry.py')
