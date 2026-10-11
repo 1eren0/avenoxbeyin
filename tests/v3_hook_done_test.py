@@ -139,10 +139,10 @@ class HookDoneLedgerTest(unittest.TestCase):
         from beyin_v3_sync import SyncEngine
         note = self.vault / "notes/task.md"
         note.parent.mkdir()
-        note.write_text('---\\n' + json.dumps({
+        note.write_text('---\n' + json.dumps({
             "id": "task", "kind": "task", "revision": 1,
             "status": "active", "visibility": "internal"
-        }) + '\\n---\\nSynthetic task body.\\n', encoding="utf-8")
+        }) + '\n---\nSynthetic task body.\n', encoding="utf-8")
         engine = SyncEngine(self.vault, self.state)
         engine.sync()
         payload = {"event_id": "e2e-replay", "session_id": "synthetic",
