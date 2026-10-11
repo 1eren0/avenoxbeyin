@@ -10,10 +10,55 @@ import sqlite3
 import time
 
 
+# metadata row: the folded directory names the last sync kept out of the index, as a JSON list.
+EXCLUDED_DIRS_ROW = 'index_excluded_dirs'
+
+
+def _record_excluded_dirs(engine, db):
+    """Store what this sync's scan excluded, inside the sync's own transaction.
+
+    The receipt readers below have the database, not the state directory, and a hook reads it
+    without syncing first. They must know which paths lost their record to the user's list,
+    and index.json cannot tell them: it may have changed since the index was built. This row
+    is committed together with the record deletions (or re-indexing) the list caused, so it
+    always describes the records the same reader sees. A release without the row ignores it.
+    """
+    keys = getattr(engine, 'excluded_dir_keys', None)
+    if keys is None:
+        return  # no scan ran on this engine; the stored row still describes the index
+    stored = db.execute('SELECT value FROM metadata WHERE key=?', (EXCLUDED_DIRS_ROW,)).fetchone()
+    value = json.dumps(sorted(keys), ensure_ascii=False) if keys else None
+    if value is None:
+        if stored:
+            db.execute('DELETE FROM metadata WHERE key=?', (EXCLUDED_DIRS_ROW,))
+    elif not stored or stored[0] != value:
+        db.execute('INSERT OR REPLACE INTO metadata VALUES (?,?)', (EXCLUDED_DIRS_ROW, value))
+
+
+def _excluded_dir_keys(db):
+    try:
+        stored = db.execute('SELECT value FROM metadata WHERE key=?', (EXCLUDED_DIRS_ROW,)).fetchone()
+        value = json.loads(stored[0]) if stored else []
+    except (sqlite3.OperationalError, ValueError):  # a bare receipts-only database has no metadata
+        return frozenset()
+    return frozenset(key for key in value if isinstance(key, str)) if isinstance(value, list) else frozenset()
+
+
 def _hidden_ref_sources(db, refs):
-    """Indexed sources that default internal context never shows (the _eligible visibility/trust gate)."""
+    """Sources that default internal context never shows: indexed records behind the _eligible
+    visibility/trust gate, and every path under a directory the last sync kept out of the index.
+
+    A path under an excluded directory has no record, so nothing says whether it is private.
+    Excluding a directory must not turn a withheld ref into a shown one, so such a path is
+    withheld like a private one, whatever the file says.
+    """
     refs = sorted(set(refs))
     hidden = set()
+    excluded = _excluded_dir_keys(db)
+    if excluded:
+        from beyin_v3_index import dir_key
+        hidden.update(ref for ref in refs
+                      if any(dir_key(part) in excluded for part in ref.replace('\\', '/').split('/')[:-1]))
     for start in range(0, len(refs), 500):
         chunk = refs[start:start + 500]
         try:
@@ -351,6 +396,7 @@ def receipt_day(created_at, zone=None):
 
 def project_receipts(engine, db, warnings=None):
     _hash, atomic, render = engine.projection_helpers()
+    _record_excluded_dirs(engine, db)
     db.execute('CREATE TABLE IF NOT EXISTS receipt_views(path TEXT PRIMARY KEY, hash TEXT NOT NULL)')
     migration = engine.state/'v2-migration.json'
     previous = json.loads(migration.read_text(encoding='utf-8')) if migration.exists() else {}

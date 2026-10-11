@@ -126,6 +126,21 @@ def receipt_line_endings_lines(report):
     return []
 
 
+def index_exclusion_lines(report, pruned=False):
+    """Lines for the user's index exclusions (state/index.json); shared by doctor, sync and preferences."""
+    if not isinstance(report, dict):
+        return []
+    lines = []
+    if report.get('excluded_dirs'):
+        lines.append('Indeks disi klasor adlari (senin listen, her derinlikte): ' +
+                     ', '.join(plain_text(name) for name in report['excluded_dirs']) +
+                     (' (bu taramada ' + str(report.get('pruned', 0)) + ' klasor atlandi)' if pruned else '') + '.')
+    if report.get('error'):
+        lines.append('index.json gecersiz (' + plain_text(report['error']) +
+                     '); klasor haric tutma listesi uygulanmiyor, her sey indeksleniyor.')
+    return lines
+
+
 def rewrite_note(entry):
     """#168: the rewrite instruction, said only once the full text is safe in the archive."""
     if entry.get('backup') in ('written', 'exists'):
@@ -199,6 +214,9 @@ def human_result(result, command, installed_version=None):
             lines.append('Haric tutulan bilesenler: ' + ', '.join(result['excluded_components']))
         if result.get('exclusion_notice'):
             lines.append(result['exclusion_notice'])
+        lines += index_exclusion_lines(result.get('index_exclusions'))
+        if result.get('index_exclusions_notice') and not (result.get('index_exclusions') or {}).get('error'):
+            lines.append(result['index_exclusions_notice'])
         lines.append('Acikken gunde en fazla bir kez GitHub surum bilgisi okunur; notlar gonderilmez.')
         lines.append('Yerel kontroller model cagirmaz. Zamanlayici kurulmaz.')
         return '\n'.join(lines)
@@ -373,6 +391,18 @@ def human_result(result, command, installed_version=None):
             lines.append('Paralel oturum bildirimi: acik (son 45 dakikada etkin ' + str(parallel.get('active', 0)) + ' oturum isareti)')
         elif parallel.get('valid') is False:
             lines.append('parallel-sessions.json gecersiz; paralel oturum bildirimi kapali sayiliyor.')
+        index_scope = result.get('index_exclusions') or {}
+        lines += index_exclusion_lines(index_scope)
+        hint = index_scope.get('vendored_hint') or {}
+        if hint.get('notes'):
+            more = len(hint.get('dirs') or []) - 3
+            lines.append('Indeks kapsami (bilgi): baska projelerin kod kopyasi gibi gorunen klasorlerde ' + str(hint['notes']) +
+                         ' not indeksli (' + ', '.join(plain_text(entry['dir']) + ': ' + str(entry['notes'])
+                                                       for entry in (hint.get('dirs') or [])[:3]) +
+                         (' ve baska klasorler' if more > 0 or hint.get('truncated') else '') +
+                         '). Senin notun degilse indeks disinda tut: ' + ('py -3' if sys.platform == 'win32' else 'python3') +
+                         ' beyin.py preferences ' + ' '.join('--index-exclude-dir ' + plain_text(name)
+                                                            for name in hint.get('names') or []))
         lines += state_location_lines(result.get('state_location'))
         lines += receipt_line_endings_lines(result.get('receipt_line_endings'))
         if status in ('needs_attention', 'pending'):
@@ -407,6 +437,8 @@ def human_result(result, command, installed_version=None):
         message = '\n\n'.join(str(r.get('source', '')) + '\n' + str(r.get('text', '')) for r in records) or 'Eslesen kaynak bulunamadi.'
     else:
         message = 'Islem sonucu: ' + str(status or 'tamamlandi')
+        if command == 'sync':
+            message = '\n'.join([message] + index_exclusion_lines(result.get('index_exclusions'), pruned=True))
     if result.get('trust_review_required'):
         message += '\nHook tanimi degisti: Codex /hooks guven incelemesini tamamla ve yeni oturum ac.'
     return message

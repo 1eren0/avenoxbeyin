@@ -18,6 +18,7 @@ if _MODULE_DIR not in sys.path:
 
 from beyin_v3 import (HARNESSES, REJECTED_AT, RETIRED_STATUSES, MemoryStore, ReceiptConflict, RevisionConflict, _json,
                       _path_redirected, _rejected_inference, _status_word, rejected_dependents, resolve_supersedes)
+from beyin_v3_index import applied_keys, dir_key, exclusions as index_exclusions, prune as prune_excluded
 from beyin_v3_projections import project_receipts
 from beyin_v3_preferences import read as read_preferences
 from beyin_v3_secrets import redact as redact_secrets, record as record_redactions
@@ -239,6 +240,8 @@ def render(metadata, body):
 
 EXCLUDED_FILES = {'agents.md', 'claude.md', 'gemini.md', 'skill.md', 'hooks.md', 'config.md', 'settings.md', 'instructions.md', 'codex.md', 'setup.md', 'install.md'}
 EXCLUDED_DIRS = {'node_modules', 'receipts', '__pycache__'}
+# User-chosen directory names (<state>/index.json) are pruned on top of these; see beyin_v3_index.
+# Nothing else is skipped by name: "vendor" or "external" is also an ordinary notes folder.
 COMPLETION_FIELDS = {'completion_contract', 'completion_criterion', 'evidence_refs'}
 TASK_STATUSES = ('inbox', 'active', 'waiting', 'blocked', 'done', 'cancelled')
 
@@ -280,6 +283,11 @@ def _has_conflict_markers(text):
 
 
 class SyncEngine:
+    # What the last scan skipped on the user's word; None while no index.json exists.
+    index_exclusions = None
+    # Folded names that scan took out of the index; None until a scan has run on this engine.
+    excluded_dir_keys = None
+
     def projection_helpers(self):
         return _hash, atomic, render
 
@@ -559,8 +567,17 @@ class SyncEngine:
     def _scan(self):
         records, warnings, conflicts = {}, [], []
         duplicate = set()
+        # Read once per sync, not per directory: the config cannot change mid-walk.
+        excluded, self.index_exclusions = index_exclusions(self.state, self.root)
+        # A listed name the walk skips anyway is a no-op. One set prunes below and is stored by
+        # project_receipts in this sync's transaction, so the receipt readers withhold exactly
+        # what the list took out of the index.
+        excluded = self.excluded_dir_keys = applied_keys(excluded, EXCLUDED_DIRS)
         for directory, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.casefold() not in EXCLUDED_DIRS and not (Path(directory) / d).is_symlink())
+            if excluded:
+                # Pruned here, so an excluded tree is never listed, read or hashed.
+                dirs[:] = prune_excluded(self.root, directory, dirs, excluded, self.index_exclusions)
             for name in sorted(files):
                 if name.startswith('.') or not name.lower().endswith('.md') or name.casefold() in EXCLUDED_FILES or name.casefold().startswith('setup-'):
                     continue
@@ -751,7 +768,17 @@ class SyncEngine:
         if dead_supersedes:
             result['supersedes_issues'] = dead_supersedes[:20]
             result['supersedes_issue_count'] = len(dead_supersedes)
+        if self.index_exclusions is not None:
+            # Reported, not a degraded scan: the user chose these names, or the file is not applied.
+            result['index_exclusions'] = self.index_exclusions
         return result
+
+    def _refuse_excluded(self, source):
+        """A new source under a directory the user keeps out of the index would be written and
+        then fail its read-back; refuse it before anything is written, naming the setting."""
+        excluded = index_exclusions(self.state, self.root)[0]
+        if excluded and any(dir_key(part) in excluded for part in Path(source).parts[:-1]):
+            raise ValueError('source is under a directory excluded from the index (excluded_dirs in index.json)')
 
     def _intent(self, relative, old_hash, content, kind, event=None):
         path = self._path(relative)
@@ -837,6 +864,7 @@ class SyncEngine:
             raise ValueError('text must be body only; put frontmatter fields in metadata')
         if not source.startswith(('notes/', 'knowledge/')) or not source.endswith('.md'):
             raise ValueError('new semantic notes belong under notes/ or knowledge/')
+        self._refuse_excluded(source)
         metadata = dict(metadata or {})
         for field in ('project', 'kind', 'status', 'updated_at'):
             if metadata.get(field) is None:
@@ -897,6 +925,7 @@ class SyncEngine:
             raise ValueError('task body and metadata required')
         if text.lstrip().startswith('---'):
             raise ValueError('text must be body only; put frontmatter fields in metadata')
+        self._refuse_excluded(source)
         allowed = {'id', 'title', 'kind', 'revision', 'status', 'owner', 'project', 'visibility', 'facts', 'next_action', 'priority', 'due_at', 'updated_at', 'completion_contract', 'completion_criterion', 'evidence_refs'}
         if set(metadata) - allowed:
             raise ValueError('unsupported task metadata')

@@ -187,6 +187,28 @@ Varsayılan 0,20 bu kurala göre seçildi: gündelik ve ajan komutu gürültüs�
 
 Aynı vault'ta ilk indeks kurulumu yaklaşık 3 saniye (birkaç tura bölünür), önbellek 9,1 MB (arşiv dışlanınca 5,5 MB). Ağır yük altında (10 çekirdekte yük ortalaması 40 civarı) sorgu başına ortanca süre not düzeyinde 1,8 saniye, pasaj yolunda 0,5 saniye; ikisinin de yaklaşık 0,3 saniyesi kaynak tazeliği kontrolü. Tek vault ve Türkçe ağırlıklı bir korpus üzerinde ölçüldü; kendi vault'unuzda ölçüp eşiği ona göre ayarlayın.
 
+## İndeks dışı klasör adları (`index.json`)
+
+Vault'un içine gömülü bir kod deposu varsa, o deponun taşıdığı başka projelerin belgeleri (`3rdparty/SDL2/README.md`, `SECURITY.md` gibi) senin notların gibi indekse girer ve aramada gerçek notların önüne geçebilir. Hangi klasör adlarının indekse hiç girmeyeceğini sen söylersin:
+
+```bash
+python3 beyin.py preferences --index-exclude-dir 3rdparty --index-exclude-dir target
+python3 beyin.py preferences --index-include-dir target   # listeden çıkar
+python3 beyin.py sync
+```
+
+- Liste klasör **adı** tutar, yol değil: `3rdparty` yazınca vault'un her derinliğindeki `3rdparty` klasörleri taranmaz. Eşleşme yol parçasının tamamıyla yapılır (`3rdparty-notlari` ya da `my3rdparty` etkilenmez), büyük/küçük harf ve Unicode biçimi (NFC/NFD) fark etmez, Türkçe `İ/i/I/ı` aynı harf sayılır. En fazla 64 ad.
+- Beyin kendiliğinden yalnız `node_modules`, `receipts`, `__pycache__`, nokta ile başlayan klasörleri ve sembolik bağları atlar; bu adları listeye yazmak serbesttir ama hiçbir şeyi değiştirmez. `vendor`, `external`, `third_party` gibi adlar **otomatik atlanmaz**: bir vault'ta gömülü kod ağacı olan `Vendor`, başka bir vault'ta tedarikçi notlarının klasörüdür ve bir güncellemeyle notların sessizce aramadan düşmesi istenmedi. Bunun yerine `doctor`, bu adlardan birini taşıyan ve içinde `README.md`, `SECURITY.md`, `CONTRIBUTING.md` gibi yukarı akış belgeleri bulunan indeksli klasörleri sayısıyla birlikte gösterir (`Indeks kapsami (bilgi): ...`) ve çalıştırılacak komutu yazar. Karar senindir.
+- `notes`, `knowledge`, `tasks` ve companion klasörü listeye alınamaz: `note-create` ve `task-create` yazdığını indeksten geri okur, oturum başı hafıza bağlamı da companion dosyalarını indeksten alır. Komut bu adları gerekçesiyle reddeder. Aynı nedenle `note-create` ve `task-create`, listedeki bir adın altına düşen yeni bir kaynağı dosyayı yazmadan reddeder.
+- Etkin liste her yerde görünür: `sync` çıktısında `index_exclusions` (`excluded_dirs`, bu taramada atlanan klasör sayısı `pruned` ve ilk 20 yol `pruned_dirs`), `doctor` ve `preferences` çıktısında `Indeks disi klasor adlari` satırı. Listen yoksa bu çıktılar değişmez.
+- Bir ad eklendiğinde bir sonraki `sync` o klasörlerdeki kayıtları indeksten siler (`deleted` sayısı, `delete` olayları) ve arama onları getirmez; dosyalara dokunulmaz. Ad listeden çıkarıldığında bir sonraki `sync` aynı dosyaları yeniden indeksler. Atlanan klasörler hiç listelenmez ve okunmaz, yani büyük bir ağaç `sync` süresine de yük olmaz.
+- Ayar makineye özeldir ve runtime klasöründeki `index.json` dosyasında durur (`{"schema": 1, "excluded_dirs": ["3rdparty"]}`); `.beyin-preferences.json` şemasına girmez. Runtime klasörünün yolu `python3 beyin.py doctor --json` çıktısında `state_location.effective_state` alanındadır (varsayılan konumlar için bkz. QUICKSTART). Dosyayı elle de yazabilirsin; kurallar aynıdır.
+- Dosya bozuksa, sembolik bağsa, 64 KB'ı aşıyorsa ya da tek bir geçersiz giriş içeriyorsa (yol ayırıcı, `.`/`..`, boş ad, korunan ad, bilinmeyen anahtar) listenin **hiçbiri** uygulanmaz: `sync` bozulmaz, her şey indekslenir ve neden `sync` çıktısındaki `index_exclusions.error` alanında ve `doctor`da `index.json gecersiz (...)` satırında görünür. Yarım uygulanmış bir liste yerine görünür bir hata tercih edildi.
+- Bu bir gizlilik sınırı değildir. Bu ayarı tanımayan bir sürüme (3.9.0 ve öncesi) dönüldüğünde dosya yok sayılır ve o klasörler yeniden indekslenir; yeniden güncellendiğinde liste kaldığı yerden uygulanır. Bir kaynağı bağlamdan kesin olarak uzak tutan şey `visibility: private` alanıdır. İndekste olmayan bir dosyanın frontmatter'ı okunmadığı için görünürlüğü de bilinemez. Bu yüzden listedeki bir klasörün altındaki her dosya, bir receipt'e kaynak olarak verildiğinde özel bir kaynak gibi ele alınır: `recap` yolunu göstermez, yalnız sayar; oturum başı bağlamı ve proje köprüsü de o receipt'i göstermez. Klasör listeden çıkarılıp yeniden indekslendiğinde karar yine notun kendi `visibility` alanına döner.
+- Listedeki bir klasörde duran not indekste olmadığı için öbür kurallara da katılmaz: başka bir notu `supersedes` ile emekliye ayırıyorsa o eski not yeniden güncel sayılır, `validity: rejected` taşıyorsa aynı iddianın yeniden önerilmesini artık engellemez. Bir klasörü listeye almadan önce içinde böyle notlar olup olmadığına bak.
+- `retrieval.json` içindeki `strict_exclude` ile farkı: o yalnız tur başı strict aramada sonuçları eler, dosyalar yine taranır, indekslenir ve `context` komutunda çıkar. `index.json` ise taramanın kendisini keser.
+- Opt-in kelime tavanı sinyali de listedeki klasörleri atlar. Gelen kutusu raporu, kapalı görev raporu ve bilgi damıtması tarihi diskteki dosyalara bakar, indekse değil; bu liste onları değiştirmez.
+
 ## Bileşen ve skill hariç tutma (susturma)
 
 Kullanıcı gereksinim duymadığı başlangıç skill'lerini, adaptörleri, başlatıcıları veya kancaları susturabilir:
