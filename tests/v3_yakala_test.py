@@ -401,6 +401,203 @@ class YakalaUnitTest(unittest.TestCase):
         (folder / 'b.md').write_text('---\ntur: not\ndurum: bekliyor\n---\n', encoding='utf-8')
         self.assertEqual(yakala.pending(self.vault), 1)
 
+    def test_emojiless_inbox_detection_and_install(self):
+        vault = Path(self.tmp.name) / 'emojiless-vault'
+        vault.mkdir(parents=True)
+        (vault / '000-Inbox').mkdir()
+        state = Path(self.tmp.name) / 'emojiless-state'
+        self.assertEqual(yakala.find_inbox(vault), '000-Inbox/Yakala')
+        res = yakala.install(vault, state, hotkey=False)
+        self.assertEqual(res['klasor'], '000-Inbox/Yakala')
+        self.assertTrue((vault / '000-Inbox/Yakala').is_dir())
+        self.assertFalse((vault / '📥 000-Inbox').exists())
+        st = yakala.status(vault, state)
+        self.assertEqual(st['klasor'], '000-Inbox/Yakala')
+
+
+class YakalaInboxTest(unittest.TestCase):
+    """Which folder holds the cards: the saved choice, the one inbox already in use, the starter, one inbox by word."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-inbox-')
+        self.addCleanup(self.tmp.cleanup)
+        self.vault, self.state = Path(self.tmp.name) / 'Örnek Beyin', Path(self.tmp.name) / 'state'
+        self.vault.mkdir()
+
+    def top(self):
+        return sorted(path.name for path in self.vault.iterdir() if not path.name.startswith('.'))
+
+    def test_renamed_inbox_is_reused(self):
+        (self.vault / '000-Inbox').mkdir()
+        yakala.capture(self.vault, url='https://ornek.com/yazi')
+        self.assertFalse((self.vault / '📥 000-Inbox').exists())
+        self.assertEqual(len(list((self.vault / '000-Inbox/Yakala').glob('*.md'))), 1)
+        self.assertEqual(yakala.clipper_template(yakala.find_inbox(self.vault))['path'], '000-Inbox/Yakala')
+        self.assertIn('(000-Inbox/Yakala)', yakala.session_notice(self.vault))
+
+    def test_inbox_choice(self):
+        import shutil
+
+        def chosen(*folders):
+            for name in folders:
+                (self.vault / name).mkdir(parents=True)
+            try:
+                return yakala.find_inbox(self.vault, self.state)
+            finally:
+                for path in self.vault.iterdir():
+                    shutil.rmtree(path)
+        self.assertEqual(chosen(), INBOX)
+        self.assertEqual(chosen('00_INBOX', 'Notlar'), '00_INBOX/Yakala')
+        self.assertEqual(chosen('GELEN KUTUSU'), 'GELEN KUTUSU/Yakala')
+        self.assertEqual(chosen('İNBOX'), 'İNBOX/Yakala')  # str.lower() alone turns this İ into two code points
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX'), INBOX)  # nothing in use yet: the starter folder wins
+        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu'), INBOX)  # two inboxes, none in use: no guess
+        self.assertEqual(chosen('Gelen Belgeler', 'Inbox Arşivi', '🔐 Kasa Inbox', '.inbox', 'Inboxing'), INBOX)
+        # Cards that already exist outrank a name: the one inbox that holds Yakala/ is the one in use.
+        self.assertEqual(chosen('00_INBOX', 'Gelen Kutusu/Yakala'), 'Gelen Kutusu/Yakala')
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX/Yakala'), '00_INBOX/Yakala')  # an emptied starter left behind
+        self.assertEqual(chosen('📥 000-Inbox/Yakala', '00_INBOX'), INBOX)
+        # Yakala/ in more than one is a tie: the starter wins when the vault has it, else no guess.
+        self.assertEqual(chosen('📥 000-Inbox/Yakala', '00_INBOX/Yakala'), INBOX)
+        self.assertEqual(chosen('📥 000-Inbox', '00_INBOX/Yakala', 'Gelen Kutusu/Yakala'), INBOX)
+        self.assertEqual(chosen('00_INBOX/Yakala', 'Gelen Kutusu/Yakala'), INBOX)
+        # A Yakala/ inside a folder that is no candidate does not count.
+        self.assertEqual(chosen('📥 000-Inbox', 'Inbox Arşivi/Yakala', '🔐 Kasa Inbox/Yakala', '.inbox/Yakala', 'Notlar/Yakala'), INBOX)
+        self.assertEqual(chosen('00_INBOX', 'Inbox Arşivi/Yakala', 'Notlar/Yakala'), '00_INBOX/Yakala')
+
+    def test_linked_folder_is_never_picked_or_followed_out(self):
+        outside = Path(self.tmp.name) / 'Disari'
+        (outside / 'Yakala').mkdir(parents=True)  # even a link whose target already holds Yakala/
+        try:
+            (self.vault / 'Inbox').symlink_to(outside, target_is_directory=True)
+        except OSError:
+            self.skipTest('this account cannot create symlinks')
+        self.assertEqual(yakala.find_inbox(self.vault, self.state), INBOX)
+        (self.vault / '📥 000-Inbox').mkdir()
+        self.assertEqual(yakala.find_inbox(self.vault, self.state), INBOX)
+        with self.assertRaises(ValueError):
+            yakala.install(self.vault, self.state, hotkey=False, folder_spec='Inbox/Yakala')
+        self.assertEqual((list((outside / 'Yakala').iterdir()), self.top(), self.state.exists()),
+                         ([], ['Inbox', '📥 000-Inbox'], False))
+
+    def test_inbox_words_are_the_doctors(self):
+        import unicodedata
+        import beyin_v3_hygiene as hygiene
+        self.assertEqual(yakala.INBOX_WORDS.pattern, hygiene.INBOX_WORDS.pattern)
+        self.assertEqual(yakala.SENSITIVE_WORDS.pattern, hygiene.SENSITIVE_WORDS.pattern)
+        for name in ('📥 000-Inbox', '00_INBOX', 'GELEN KUTUSU', 'İNBOX', 'ınbox', 'MÜŞTERİLER',
+                     unicodedata.normalize('NFD', 'Inbox Arşivi')):
+            self.assertEqual(yakala._name_words(name), hygiene._name_words(name), name)
+        for name in ('📥 000-Inbox', '00_INBOX', 'Gelen Kutusu', 'GelenKutum', 'Gelen Belgeler', '🔐 Kasa Inbox', 'Notlar'):
+            doctor = hygiene._inbox_folder(name, None) and not hygiene.sensitive_excluded(name)
+            self.assertEqual(yakala._inbox_name(name), doctor, name)
+        # The doctor reports an archive that carries the word; yakala never writes into one by a guess.
+        self.assertTrue(hygiene._inbox_folder('Inbox Arşivi', None))
+        self.assertFalse(yakala._inbox_name(unicodedata.normalize('NFD', 'Inbox Arşivi')))
+
+    def test_folder_outside_the_vault_is_refused_before_anything_is_written(self):
+        outside = Path(self.tmp.name) / 'Disari'
+        for spec in ('../Disari/Yakala', str(outside / 'Yakala'), 'Notlar/../../Disari', '', '.', '.obsidian/Yakala'):
+            with self.assertRaises(ValueError, msg=spec):
+                yakala.install(self.vault, self.state, hotkey=False, folder_spec=spec)
+        with self.assertRaises(ValueError):
+            yakala.main(['kur', '--kisayol-yok', '--klasor', '../Disari/Yakala'], vault=self.vault, state=self.state)
+        self.assertEqual((outside.exists(), self.state.exists(), list(self.vault.iterdir())), (False, False, []))
+        (self.vault / 'not.md').write_text('# not\n', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            yakala.chosen_inbox(self.vault, 'not.md')
+        # Inside the vault every spelling means the same folder.
+        for spec in ('Notlar/Yakala', 'Notlar\\Yakala/', 'Notlar/Gecici/../Yakala', str(self.vault / 'Notlar/Yakala')):
+            self.assertEqual(yakala.chosen_inbox(self.vault, spec), 'Notlar/Yakala', spec)
+
+    def test_chosen_folder_is_read_from_the_state_it_was_saved_in(self):
+        import io
+        installed = yakala.install(self.vault, self.state, hotkey=False, folder_spec='Notlar/Yakala')
+        self.assertEqual(installed['klasor'], 'Notlar/Yakala')
+        self.assertEqual(json.loads((self.state / 'yakala.json').read_text(encoding='utf-8'))['klasor'], 'Notlar/Yakala')
+        self.assertEqual(yakala.status(self.vault, self.state)['klasor'], 'Notlar/Yakala')
+
+        def cli(*argv):
+            with patch('sys.stdout', new_callable=io.StringIO) as out:
+                yakala.main([*argv, '--json'], vault=self.vault, state=self.state)
+            return json.loads(out.getvalue())
+        self.assertEqual(cli('durum')['klasor'], 'Notlar/Yakala')
+        self.assertTrue(cli('ekle', '--metin', 'deneme')['path'].startswith('Notlar/Yakala/'))
+        self.assertEqual(cli('liste')['bekleyen'], 1)
+        self.assertEqual(cli('sablon')['path'], 'Notlar/Yakala')
+        self.assertIn('Yakalanan 1 kaynak bekliyor (Notlar/Yakala)', yakala.session_notice(self.vault, self.state))
+        self.assertEqual(self.top(), ['Notlar'])
+        # Another state directory knows nothing of that choice; `kur` without --klasor keeps it.
+        self.assertEqual(yakala.find_inbox(self.vault, Path(self.tmp.name) / 'other-state'), INBOX)
+        again = yakala.install(self.vault, self.state, hotkey=False)
+        self.assertEqual(again['klasor'], 'Notlar/Yakala')
+        template = json.loads((self.vault / again['web_clipper_sablonu']).read_text(encoding='utf-8'))
+        skill = (self.vault / '.agents/skills/beyin-yakala/SKILL.md').read_text(encoding='utf-8')
+        self.assertEqual(template['path'], 'Notlar/Yakala')
+        self.assertIn('`Notlar/Yakala/`', skill)
+        self.assertNotIn('000-Inbox', skill)
+
+    def test_existing_cards_keep_their_folder_and_are_never_moved(self):
+        # A vault as 3.9.0 left it: cards under the starter path, the user's own inbox beside it, no saved folder.
+        (self.vault / INBOX).mkdir(parents=True)
+        (self.vault / '000-Inbox').mkdir()
+        waiting = yakala.capture(self.vault, url='https://ornek.com/eski', state=self.state)
+        done = yakala.find_card(self.vault, yakala.capture(self.vault, text='bitti', state=self.state)['id'], self.state)
+        yakala.write_card(done['path'], dict(done['meta'], durum='islendi'), done['body'])
+        self.state.mkdir()
+        (self.state / 'yakala.json').write_text('{"schema": 1, "session_notice": true, "kisayol": null, "tus": "ctrl+alt+b"}\n',
+                                                encoding='utf-8')
+        self.assertTrue(waiting['path'].startswith(INBOX + '/'))
+        self.assertEqual((yakala.find_inbox(self.vault, self.state), yakala.pending(self.vault, self.state)), (INBOX, 1))
+        same = yakala.install(self.vault, self.state, hotkey=False)
+        self.assertEqual((same['klasor'], 'onceki_klasor' in same), (INBOX, False))
+        # The user picks the other folder: the queue that stays behind is reported, not moved.
+        moved = yakala.install(self.vault, self.state, hotkey=False, folder_spec='000-Inbox/Yakala')
+        self.assertEqual((moved['klasor'], moved['onceki_klasor'], moved['onceki_klasorde_kalan']), ('000-Inbox/Yakala', INBOX, 1))
+        self.assertIn('UYARI: 1 kart eski klasorde kaldi (' + INBOX + ')', yakala.human(moved, 'kur'))
+        self.assertTrue((self.vault / waiting['path']).is_file())
+        self.assertEqual(yakala.pending(self.vault, self.state), 0)
+        self.assertIn('000-Inbox/Yakala/', yakala.capture(self.vault, text='yeni', state=self.state)['path'])
+
+    def test_saved_folder_that_is_gone_or_edited_is_not_trusted(self):
+        (self.vault / '000-Inbox').mkdir()
+        self.assertEqual(yakala.install(self.vault, self.state, hotkey=False)['klasor'], '000-Inbox/Yakala')
+        yakala.capture(self.vault, text='not', state=self.state)
+        (self.vault / '000-Inbox').rename(self.vault / '00_INBOX')  # the saved folder no longer exists
+        self.assertEqual((yakala.find_inbox(self.vault, self.state), yakala.pending(self.vault, self.state)), ('00_INBOX/Yakala', 1))
+        (Path(self.tmp.name) / 'Disari').mkdir()
+        for saved in ('"../Disari"', '7', '[]'):
+            (self.state / 'yakala.json').write_text('{"schema": 1, "klasor": ' + saved + '}\n', encoding='utf-8')
+            self.assertEqual(yakala.find_inbox(self.vault, self.state), '00_INBOX/Yakala', saved)
+
+    def test_raw_text_and_files_stay_out_of_git_in_any_folder(self):
+        none = {name: None for name in ('npx', 'yt_dlp', 'whisper', 'pdftotext', 'ffmpeg')}
+        source = Path(self.tmp.name) / 'not.txt'
+        source.write_text('dosyadaki ders', encoding='utf-8')
+        yakala.install(self.vault, self.state, hotkey=False, folder_spec='Notlar/Kaynaklar')
+        yakala.capture(self.vault, files=[source], state=self.state)
+        with patch.object(yakala, 'tools', return_value=none):
+            result = yakala.process(self.vault, state=self.state)
+        self.assertEqual([entry['ham'].rsplit('/', 1)[0] for entry in result['kartlar']], ['Notlar/Kaynaklar/.ham'])
+        for private in ('.ham', 'dosyalar'):
+            self.assertEqual((self.vault / 'Notlar/Kaynaklar' / private / '.gitignore').read_text(encoding='utf-8'), '*\n')
+
+    def test_nfd_folder_name_round_trips(self):
+        import unicodedata
+        nfc = 'Günlük Inbox'
+        (self.vault / unicodedata.normalize('NFD', nfc)).mkdir()
+        on_disk = self.top()[0]  # the file system decides which form it keeps
+        installed = yakala.install(self.vault, self.state, hotkey=False)
+        self.assertEqual(installed['klasor'], on_disk + '/Yakala')
+        self.assertTrue(yakala.capture(self.vault, text='not', state=self.state)['path'].startswith(on_disk + '/Yakala/'))
+        template = json.loads((self.vault / installed['web_clipper_sablonu']).read_text(encoding='utf-8'))
+        self.assertEqual((template['path'], yakala.status(self.vault, self.state)['klasor']), (on_disk + '/Yakala',) * 2)
+        self.assertIn('(' + on_disk + '/Yakala)', yakala.session_notice(self.vault, self.state))
+        if (self.vault / nfc).is_dir():  # APFS and HFS+ read both forms as one name; ext4 and NTFS keep them apart
+            again = yakala.install(self.vault, self.state, hotkey=False, folder_spec=nfc + '/Yakala')
+            self.assertEqual((again['klasor'], 'onceki_klasor' in again), (on_disk + '/Yakala', False))
+            self.assertEqual((self.top(), yakala.pending(self.vault, self.state)), ([on_disk], 1))
+
 
 class YakalaInstalledTest(unittest.TestCase):
     def setUp(self):
@@ -475,6 +672,24 @@ class YakalaInstalledTest(unittest.TestCase):
         self.entry('kur', '--kisayol-yok')
         self.entry('kaldir')
         self.assertEqual(own.read_text(encoding='utf-8'), 'kendi skill\'im\n')
+
+    def test_renamed_inbox_through_the_installed_entry(self):
+        (self.vault / '000-Inbox').mkdir()
+        refused = subprocess.run([sys.executable, str(self.vault / 'beyin.py'), 'yakala', 'kur', '--kisayol-yok', '--klasor',
+                                  '../Disari/Yakala'], capture_output=True, text=True, encoding='utf-8', env=self.env,
+                                 cwd=self.vault, timeout=60)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn('vault\'un icinde olmali', refused.stderr)
+        self.assertFalse((Path(self.tmp.name) / 'Disari').exists() or (self.state / 'yakala.json').exists())
+        installed = self.entry('kur', '--kisayol-yok')
+        self.assertEqual(installed['klasor'], '000-Inbox/Yakala')
+        self.assertEqual(installed['web_clipper_sablonu'], '000-Inbox/Yakala/beyne-at-web-clipper.json')
+        self.assertTrue(self.entry('ekle', 'https://ornek.com/yazi')['path'].startswith('000-Inbox/Yakala/'))
+        self.assertIn('Yakalanan 1 kaynak bekliyor (000-Inbox/Yakala)', self.session_start())
+        self.assertEqual((self.entry('durum')['klasor'], self.entry('sablon')['path']), ('000-Inbox/Yakala',) * 2)
+        skill = (self.vault / '.agents/skills/beyin-yakala/SKILL.md').read_text(encoding='utf-8')
+        self.assertIn('`000-Inbox/Yakala/`', skill)
+        self.assertFalse((self.vault / '📥 000-Inbox').exists())
 
 
 if __name__ == '__main__':
