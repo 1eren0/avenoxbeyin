@@ -642,6 +642,9 @@ not knowledge synthesis.
     # they were writing most likely never reached daily/.
     if migration_plan and migration_plan.get('orphaned_legacy_state'):
         result['orphaned_legacy_state'] = migration_plan['orphaned_legacy_state']
+    # Prompt-counter lock directories old enough for V2's own sweep: left where they are.
+    if migration_plan and migration_plan.get('stale_legacy_locks'):
+        result['stale_legacy_locks'] = migration_plan['stale_legacy_locks']
     return result
 
 

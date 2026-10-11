@@ -1,11 +1,13 @@
 """Read-preserving V2 cutover guards and receipts; no legacy replay/model calls."""
 from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import time
 
 LEGACY_RUNNERS = ['.claude/scripts/flush.py', '.claude/scripts/compile.py'] + ['.claude/hooks/'+name+suffix for name in ('session-start', 'session-end', 'pre-compact', 'prompt-counter') for suffix in ('.sh', '.ps1')]
@@ -17,6 +19,14 @@ LEGACY_RUNNERS = ['.claude/scripts/flush.py', '.claude/scripts/compile.py'] + ['
 # hour (STALE_HOOK_INPUT_SECONDS in flush.py).
 ORPHANED_FLUSH_SECONDS = 3600
 RECONCILE_HINT = ' with no V2 writer running, set its status to a terminal value such as "fail" and rerun'
+# V2's prompt counter locks with mkdir, not with a lock on a file: prompt_count.<key>.lock is a
+# directory it holds for some milliseconds and removes again. A hook killed in between leaves
+# the directory behind, and no V2 hook ever steals it; the only thing that removes it is V2's
+# own session-start sweep, which takes an empty prompt_count.*.lock directory once it is eight
+# days old (find -mtime +7 counts whole days; the PowerShell port takes it at seven). The guard
+# reads that same rule and never removes anything itself.
+STALE_LOCK_DIRECTORY_SECONDS = 8 * 86400
+FOREIGN_HINT = '; review it locally and move it out of the V2 state directory, then rerun'
 
 
 def _hash(path):
@@ -82,16 +92,48 @@ def migration_guard(vault_root, state_dir):
     if state.is_relative_to(vault):
         raise ValueError('migration state must be outside vault')
     legacy = _legacy_root(vault)
-    orphaned = []
+    orphaned, stale = [], []
     with ExitStack() as stack:
         if legacy.exists():
+            now = time.time()
             held = set()
             for path in sorted(legacy.glob('*.lock')):
+                relative = path.relative_to(vault).as_posix()
                 if path.is_symlink():
-                    raise RuntimeError('legacy writer lock symlink requires review')
-                stack.enter_context(_legacy_lock(path))
+                    raise RuntimeError('legacy writer lock in ' + relative + ' is a symlink' + FOREIGN_HINT)
+                try:
+                    info = path.lstat()
+                except FileNotFoundError:
+                    continue  # a prompt counter released its directory between the listing and now
+                except OSError as exc:
+                    raise RuntimeError('legacy writer lock in ' + relative + ' cannot be examined (' +
+                                       (exc.strerror or type(exc).__name__) + '); make it readable for this user, then rerun') from exc
+                if stat.S_ISDIR(info.st_mode):
+                    try:
+                        swept_by_v2 = fnmatch.fnmatchcase(path.name, 'prompt_count.*.lock') and not any(path.iterdir())
+                    except FileNotFoundError:
+                        continue  # released while it was being looked at
+                    except OSError:
+                        swept_by_v2 = False
+                    if not swept_by_v2:
+                        raise RuntimeError('legacy writer lock in ' + relative +
+                                           ' is a directory that is not an empty V2 prompt-counter lock' + FOREIGN_HINT)
+                    if not 0 <= info.st_mtime <= now - STALE_LOCK_DIRECTORY_SECONDS:
+                        raise RuntimeError('legacy writer lock directory in ' + relative + ' is less than ' +
+                                           str(STALE_LOCK_DIRECTORY_SECONDS // 86400) + ' days old; a V2 prompt counter holds'
+                                           ' it only for an instant, so rerun. If it is still there and no V2 session is'
+                                           ' running, it is a leftover: remove that empty directory and rerun')
+                    stale.append(relative)
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise RuntimeError('legacy writer lock in ' + relative + ' is not a regular file' + FOREIGN_HINT)
+                try:
+                    stack.enter_context(_legacy_lock(path))
+                except OSError as exc:
+                    raise RuntimeError('legacy writer lock in ' + relative + ' cannot be opened (' +
+                                       (exc.strerror or type(exc).__name__) +
+                                       '); make it readable and writable for this user, then rerun') from exc
                 held.add(path.name)
-            now = time.time()
             for path in legacy.glob('*.json'):
                 if not path.name.startswith(('flush-', 'compile', 'antigravity-')):
                     continue
@@ -137,6 +179,8 @@ def migration_guard(vault_root, state_dir):
                 'historical_receipts': sorted(p.relative_to(vault).as_posix() for p in (vault/'receipts').glob('*.md'))}
         if orphaned:
             plan['orphaned_legacy_state'] = sorted(orphaned)
+        if stale:
+            plan['stale_legacy_locks'] = sorted(stale)
         if prior.exists():
             plan['previous'] = json.loads(prior.read_text(encoding='utf-8'))
         # Runners the user kept at install time stay theirs on every later update.
