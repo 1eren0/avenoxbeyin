@@ -53,7 +53,8 @@ def _hidden_ref_sources(db, refs):
     withheld like a private one, whatever the file says.
     """
     refs = sorted(set(refs))
-    hidden = set()
+    from beyin_v3_hygiene import sensitive_source
+    hidden = {ref for ref in refs if sensitive_source(ref)}
     excluded = _excluded_dir_keys(db)
     if excluded:
         from beyin_v3_index import dir_key
