@@ -890,8 +890,9 @@ class MemoryStore:
             weighted.append((weight, record))
         return self._by_weight(weighted)
 
-    # Strict automatic context: used by the per-turn hook so that a single shared common
-    # word never pulls an unrelated note into the prompt. Weight = sum of relative idf over
+    # Strict automatic context: multiword queries need two shared words so that an incidental
+    # common word cannot pull an unrelated note into the prompt. One-word queries use a
+    # separate weight floor and still reject weak matches. Weight = sum of relative idf over
     # shared terms, divided by log(10 + note vocabulary size). Relative idf (idf / idf of a
     # term seen in exactly one note) keeps the scale independent of vault size, so the
     # threshold works for a 20-note vault and a 300-note vault alike.
