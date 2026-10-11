@@ -177,6 +177,108 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertTrue(agent.exists())
         self.assertNotIn('LaunchAgent', result['kaldirilan'])
 
+    def test_mac_install_plist_keepalive(self):
+        state = Path(self.tmp.name) / 'mac-state'
+        agent = Path(self.tmp.name) / 'agent.plist'
+        with patch.object(yakala, '_launch_agent', return_value=agent), \
+                patch.object(yakala.sys, 'platform', 'darwin'), \
+                patch.object(yakala.os, 'getuid', return_value=501, create=True), \
+                patch.object(yakala, '_listener_ok', return_value=True), \
+                patch.object(yakala.subprocess, 'run'):
+            yakala.install(self.vault, state)
+            import plistlib
+            plist = plistlib.loads(agent.read_bytes())
+            self.assertIs(plist['KeepAlive'], True)
+
+    def mac(self, agent, launchctl):
+        """The macOS branches on any OS: a temp LaunchAgent path, `launchctl` answers every subprocess.run."""
+        import contextlib
+        stack = contextlib.ExitStack()
+        for item in (patch.object(yakala, '_launch_agent', return_value=agent), patch.object(yakala.sys, 'platform', 'darwin'),
+                     patch.object(yakala.os, 'getuid', return_value=501, create=True), patch('time.sleep'),
+                     patch.object(yakala.subprocess, 'run', side_effect=launchctl)):
+            stack.enter_context(item)
+        return stack
+
+    def test_listener_leaves_the_dock_before_the_event_loop(self):
+        import ctypes
+        from unittest.mock import MagicMock
+        order = []
+
+        def send(target, selector, *rest):
+            order.append((target, selector, [value.value for value in rest[1:]]))
+            return 'app' if selector == b'sharedApplication' else None
+        objc, carbon = MagicMock(), MagicMock()
+        objc.objc_getClass.side_effect = lambda name: name
+        carbon.InstallEventHandler.return_value = carbon.RegisterEventHotKey.return_value = 0
+        carbon.RunApplicationEventLoop.side_effect = lambda: order.append('loop')
+        script = SCRIPTS / 'beyin_v3_yakala.py'
+        with patch.object(yakala, '_objc', return_value=(objc, send)), patch.object(ctypes, 'CDLL', return_value=carbon):
+            yakala.listen_mac(self.vault, script, 103, 0x1A00)
+        # NSApplicationActivationPolicyProhibited (2) on the shared application, and only then the loop.
+        self.assertEqual(order, [(b'NSApplication', b'sharedApplication', []), ('app', b'setActivationPolicy:', [2]), 'loop'])
+        self.assertEqual(carbon.RegisterEventHotKey.call_args.args[:2], (103, 0x1A00))
+        # AppKit that cannot be loaded costs the hidden Dock icon, never the hotkey.
+        with patch.object(yakala, '_objc', side_effect=OSError('AppKit')), patch.object(ctypes, 'CDLL', return_value=carbon):
+            yakala.listen_mac(self.vault, script, 103, 0x1A00)
+        self.assertEqual(order[-2:], ['loop', 'loop'])
+
+    def test_mac_install_replaces_the_running_listener(self):
+        import plistlib
+        state, agent, calls = Path(self.tmp.name) / 'mac-state', Path(self.tmp.name) / 'agent.plist', []
+        script = SCRIPTS / 'beyin_v3_yakala.py'
+
+        def launchctl(command, **_options):
+            calls.append((command[1], agent.exists()))
+            return subprocess.CompletedProcess(command, 0, b'\tstate = running\n', b'')
+        with self.mac(agent, launchctl):
+            self.assertIs(yakala.install(self.vault, state)['kisayol_calisiyor'], True)
+        # The old job leaves launchd before the new plist is loaded; KeepAlive would restart it otherwise.
+        self.assertEqual(calls, [('bootout', False), ('bootstrap', True), ('print', True)])
+        arguments = plistlib.loads(agent.read_bytes())['ProgramArguments']
+        runner = Path(arguments[1])
+        self.assertEqual(runner, state.resolve() / 'yakala' / script.name)
+        self.assertEqual(arguments[2:5], ['dinle', '--vault', str(self.vault.resolve())])
+        self.assertEqual(runner.read_bytes(), script.read_bytes())
+        # An update replaces only the vault script; the listener keeps its own copy until `kur` runs again.
+        runner.write_text('# the release this listener was installed from\n', encoding='utf-8')
+        del calls[:]
+        with self.mac(agent, launchctl):
+            yakala.install(self.vault, state)
+        self.assertEqual(calls, [('bootout', True), ('bootstrap', True), ('print', True)])
+        self.assertEqual(runner.read_bytes(), script.read_bytes())
+
+    def test_uninstall_boots_the_listener_out_before_its_files_go(self):
+        state, agent, calls = Path(self.tmp.name) / 'mac-state', Path(self.tmp.name) / 'agent.plist', []
+        runner = state / 'yakala/beyin_v3_yakala.py'
+
+        def launchctl(command, **_options):
+            calls.append((command[1:], agent.exists(), runner.exists()))
+            return subprocess.CompletedProcess(command, 0, b'\tstate = running\n', b'')
+        with self.mac(agent, launchctl):
+            yakala.install(self.vault, state)
+            del calls[:]
+            result = yakala.uninstall(self.vault, state)
+        # A job that is still loaded would be restarted every ten seconds with its script gone.
+        self.assertEqual(calls, [(['bootout', 'gui/501/' + yakala.LAUNCH_LABEL], True, True)])
+        self.assertIn('LaunchAgent', result['kaldirilan'])
+        self.assertFalse(agent.exists() or runner.exists() or (state / 'yakala.json').exists())
+
+    def test_status_tells_a_loaded_but_stopped_listener(self):
+        state, agent = Path(self.tmp.name) / 'mac-state', Path(self.tmp.name) / 'agent.plist'
+        answer = [b'\tstate = running\n']
+
+        def launchctl(command, **_options):
+            return subprocess.CompletedProcess(command, 0, answer[0], b'')
+        with self.mac(agent, launchctl):
+            yakala.install(self.vault, state)
+            self.assertIs(yakala.status(self.vault, state)['dinleyici_calisiyor'], True)
+            # What `launchctl print` says after Dock > Quit on a 3.9.0 install: exit status 0, job still loaded.
+            answer[0] = b'\tstate = not running\n\tlast exit code = 0\n'
+            stopped = yakala.status(self.vault, state)
+        self.assertIs(stopped['dinleyici_calisiyor'], False)
+        self.assertIn('durmus (baslatmak icin: beyin.py yakala kur)', yakala.human(stopped, 'durum'))
+
     def test_inbox_report_skips_processed_cards(self):
         import beyin_v3_hygiene as hygiene
         waiting = yakala.capture(self.vault, url='https://ornek.com/a')
