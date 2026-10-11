@@ -115,10 +115,14 @@ def summary(state, harnesses):
     SQLite. COUNT(*) plus live files minus overlapping keys avoids double counts.
     SQL DISTINCT avoids loading the whole historical ledger into Python.
     """
-    paths = list((Path(state) / "hook-done").glob("*.json"))
     observed = {harness: set() for harness in harnesses}
-    for path in paths:
-        event = json.loads(path.read_text(encoding="utf-8"))
+    paths = []
+    for path in (Path(state) / "hook-done").glob("*.json"):
+        try:
+            event = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue  # Cleanup committed its ledger row before removing this marker.
+        paths.append(path)
         if event.get("harness") in observed:
             observed[event["harness"]].add(event.get("event", "unknown"))
     count = len(paths)
