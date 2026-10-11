@@ -112,10 +112,11 @@ def migration_guard(vault_root, state_dir):
                             and path.with_suffix('.lock').name in held):
                         # The lock is only as wide as this machine and this lock interface, and
                         # the state directory travels with a synced vault: a flush that is still
-                        # running on another machine, or under WSL next to a Windows Python, leaves
-                        # the same sentinel beside a lock that is free here. Such a writer is done
-                        # within minutes of the start time it recorded, so the proof also needs
-                        # that time to be an hour old. A record without it is not a stock sentinel.
+                        # running on another machine leaves the same sentinel beside a lock that
+                        # is free here, and one under WSL next to a Windows Python may too. Such a
+                        # writer is done within minutes of the start time it recorded, so the proof
+                        # also needs that time to be an hour old. A record without it is not a
+                        # stock sentinel.
                         started = item.get('ts')
                         if (isinstance(started, (int, float)) and not isinstance(started, bool)
                                 and 0 <= started <= now - ORPHANED_FLUSH_SECONDS):

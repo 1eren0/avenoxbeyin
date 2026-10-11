@@ -21,15 +21,15 @@ One such state is treated as proven dead. Every V2 release that writes
 it until its terminal status, so on this machine a sentinel whose own lock the
 guard holds was left by a writer that died, for example a logout or shutdown in
 the middle of a summary. That lock says nothing about a flush still running on
-another machine that syncs the vault, or through another lock interface (WSL
-next to a Windows Python), so the sentinel's own start time (`ts`) must also be
-at least 60 minutes old; a stock flush is done about ten minutes after it. Such a
-sentinel does not block: the file is preserved as it is and its path is listed as
-`orphaned_legacy_state` in the installer result and, at the first cutover, in
-`v2-migration.json`. The summary it was writing most likely never reached
-`daily/`. The same holds on every later `update` for a flush kept with
-`--keep-customized-legacy`; the `update` result lists, and its message counts,
-the sentinels that the cutover receipt does not already name.
+another machine that syncs the vault, and may say nothing across lock interfaces
+(a flush under WSL next to a Windows Python), so the sentinel's own start time
+(`ts`) must also be at least 60 minutes old; a stock flush is done about ten
+minutes after it. Such a sentinel does not block: the file is preserved as it is
+and its path is listed as `orphaned_legacy_state` in the installer result and, at
+the first cutover, in `v2-migration.json`. The summary it was writing most likely
+never reached `daily/`. The same holds on every later `update` for a flush kept
+with `--keep-customized-legacy`; the `update` result lists, and its message
+counts, the sentinels that the cutover receipt does not already name.
 
 Everything else still blocks:
 
