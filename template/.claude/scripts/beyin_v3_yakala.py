@@ -266,7 +266,55 @@ def _which(*names):
     return None
 
 
+# On Windows a helper resolved to a batch file (.cmd/.bat) is launched through cmd.exe, which
+# acts on & | < > ^ ( ) " and % in the arguments before the batch script ever sees them. Python's
+# list2cmdline only quotes whitespace, so those characters reach cmd.exe unquoted and a captured
+# URL (clipboard, Web Clipper card or shared link) can be truncated or run as a command. We never
+# let an argument reach cmd.exe: an npm .cmd shim is rewritten to the node.exe call it stands for
+# (CreateProcess, no interpreter), and any other batch helper is declined for that input so the
+# caller falls back. A real executable (CreateProcess) and every non-Windows platform are untouched.
+_CMD_METACHARACTERS = frozenset('&|<>^%"()') | {'\r', '\n'}
+
+
+class _UnsafeBatchArgument(OSError):
+    """Declined rather than hand cmd.exe an argument it could interpret; callers fall back."""
+
+
+def _node_shim_rewrite(command):
+    """An npm npx.cmd/npm.cmd launcher runs `node.exe <...>\\node_modules\\npm\\bin\\<name>-cli.js`.
+    Calling node.exe directly passes the same arguments through CreateProcess, so nothing goes
+    through cmd.exe. The layout holds for the official Node installer, nvm-windows and fnm (a real
+    Node directory on PATH), and for scoop/choco when they put that directory on PATH; a bare shim
+    with no sibling node.exe is not rewritten and falls through to the decline path."""
+    launcher = Path(command[0])
+    cli = {'npx': 'npx-cli.js', 'npm': 'npm-cli.js'}.get(launcher.stem.lower())
+    if not cli:
+        return None
+    node = launcher.with_name('node.exe')
+    script = launcher.parent / 'node_modules' / 'npm' / 'bin' / cli
+    if node.is_file() and script.is_file():
+        return [str(node), str(script), *command[1:]]
+    return None
+
+
+def _windows_safe_command(command):
+    """Choke point: keep a child process's arguments away from cmd.exe on Windows. A real
+    executable is launched by CreateProcess and is returned unchanged; only a .cmd/.bat launcher
+    would reach cmd.exe, so it is either rewritten to bypass the interpreter or declined."""
+    command = [str(part) for part in command]
+    if Path(command[0]).suffix.lower() not in ('.cmd', '.bat'):
+        return command
+    rewritten = _node_shim_rewrite(command)
+    if rewritten is not None:
+        return rewritten
+    if any(ch in _CMD_METACHARACTERS for part in command[1:] for ch in part):
+        raise _UnsafeBatchArgument(Path(command[0]).name)
+    return command
+
+
 def _run(command, timeout, cwd=None):
+    if os.name == 'nt':
+        command = _windows_safe_command(command)
     env = dict(os.environ, PYTHONIOENCODING='utf-8', NO_COLOR='1')
     result = subprocess.run(command, capture_output=True, timeout=timeout, cwd=cwd, env=env,
                             stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
