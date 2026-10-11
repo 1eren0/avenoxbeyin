@@ -1591,6 +1591,30 @@ def popup(vault, context=None, state=None):
     root.bind('<KP_Enter>', save)
     root.bind('<Escape>', lambda _e: close())
 
+    # Drag the borderless window by any empty canvas spot; items with their own click binding keep it.
+    drag = {'on': False, 'ox': 0, 'oy': 0, 'cursor': ''}
+
+    def drag_start(event):
+        hit = canvas.find_withtag('current')
+        if hit and canvas.tag_bind(hit[0]):
+            return
+        drag.update(on=True, ox=event.x_root - root.winfo_x(), oy=event.y_root - root.winfo_y(),
+                    cursor=canvas.cget('cursor'))
+        canvas.configure(cursor='fleur')
+
+    def drag_move(event):
+        if drag['on']:
+            root.geometry('+%d+%d' % (event.x_root - drag['ox'], event.y_root - drag['oy']))
+
+    def drag_end(_event=None):
+        if drag['on']:
+            drag['on'] = False
+            canvas.configure(cursor=drag['cursor'])
+            entry.focus_set()
+    canvas.bind('<ButtonPress-1>', drag_start)
+    canvas.bind('<B1-Motion>', drag_move)
+    canvas.bind('<ButtonRelease-1>', drag_end)
+
     root.update_idletasks()
     x = (root.winfo_screenwidth() - W) // 2
     top = max(80, int(root.winfo_screenheight() * 0.22))
