@@ -130,7 +130,7 @@ class TurkishIssueCaseTest(VaultTestCase):
 
 
 class TurkishStrictContextTest(VaultTestCase):
-    """Strict per-turn context still needs two matched query words, inflected or not."""
+    """Strict context admits one-word queries while retaining the two-word multiword gate."""
 
     def setUp(self):
         super().setUp()
@@ -139,9 +139,9 @@ class TurkishStrictContextTest(VaultTestCase):
         self.ingest('mutfak', 'Mutfak alışverişi: elma, ekmek, zeytinyağı.', 'notes/mutfak.md')
         self.ingest('gunluk', 'Gün sonu kaydı. ' + FILLER * 30, 'daily/2026-09-18.md')
 
-    def test_one_inflected_word_cannot_clear_the_strict_gate(self):
+    def test_one_inflected_word_can_find_a_matching_note(self):
         self.assertEqual(self.ids('kütüphanesi', strict=False), ['yedekleme'])
-        self.assertEqual(self.ids('kütüphanesi', strict=True), [])
+        self.assertEqual(self.ids('kütüphanesi', strict=True), ['yedekleme'])
 
     def test_two_inflected_words_still_reach_strict_context(self):
         self.assertEqual(self.ids('kütüphanenin yedeklemeleri', strict=True), ['yedekleme'])
