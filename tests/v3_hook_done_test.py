@@ -108,6 +108,27 @@ class HookDoneLedgerTest(unittest.TestCase):
         self.assertEqual(ledger.prune(self.store), 1)
         self.assertFalse(old.exists())
 
+    def test_doctor_ignores_file_removed_during_concurrent_cleanup(self):
+        key, old = self.marker("racy")
+        original = Path.unlink
+        def deny_done_unlink(path, *args, **kwargs):
+            if path == old:
+                raise PermissionError("keep both copies for race test")
+            return original(path, *args, **kwargs)
+        with patch.object(Path, "unlink", deny_done_unlink):
+            with self.assertRaises(PermissionError):
+                ledger.prune(self.store)
+        self.assertTrue(ledger.acknowledged(self.state, key))
+        real_read_text = Path.read_text
+        def disappearing_marker(path, *args, **kwargs):
+            if path == old:
+                raise FileNotFoundError("marker removed after glob")
+            return real_read_text(path, *args, **kwargs)
+        with patch.object(Path, "read_text", disappearing_marker):
+            report = ledger.summary(self.state, ("claude",))
+        self.assertEqual(report["acknowledged_events"], 1)
+        self.assertEqual(report["lifecycle"]["claude"]["events"], ["SessionEnd"])
+
     def test_invalid_or_symlinked_file_is_never_deleted(self):
         key, invalid = self.marker("invalid")
         invalid.write_text("{bad-json", encoding="utf-8")
