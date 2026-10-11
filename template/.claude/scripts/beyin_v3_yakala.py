@@ -336,29 +336,31 @@ def _base(code):
 
 
 def _spoken(data, recognised):
-    """The language spoken in the video as yt-dlp metadata tells it; None when it does not."""
+    """(language spoken in the video as yt-dlp metadata tells it or None, whether the video carries dubs)."""
     audio = {}
     for fmt in data.get('formats') or []:
         if isinstance(fmt, dict) and fmt.get('language'):
             audio.setdefault(str(fmt['language']), set()).add(fmt.get('language_preference'))
+    several = len({_base(code) for code in audio}) > 1  # `en` next to `en-desc` is an audio description, not a dub
     original = [code for code, marks in audio.items() if 10 in marks]  # yt-dlp: 10 is the original audio track
     if len(original) == 1:
         spoken = original[0]
-    elif len({_base(code) for code in audio}) > 1:
-        return None  # several audio languages and none marked original: any pick would be a guess
+    elif several:
+        spoken = None  # several audio languages and none marked original: any pick would be a guess
     else:
         spoken = data.get('language') or (recognised[0][:-5] if len(recognised) == 1 else None)
-    return str(spoken) if spoken and LANGUAGE.fullmatch(str(spoken)) else None
+    dubbed = several or len({_base(key) for key in recognised}) > 1  # recognised speech in more than one language
+    return str(spoken) if spoken and LANGUAGE.fullmatch(str(spoken)) else None, dubbed
 
 
 def youtube_tracks(url, found, workdir):
-    """One yt-dlp metadata request: {'dil': spoken language or None, 'adaylar': [(track, automatic), ...]}.
+    """One yt-dlp metadata request: {'dil': spoken language or None, 'dublaj': bool, 'adaylar': [(track, automatic), ...]}.
 
     `-orig` is the speech recognition of one audio track. An auto-dubbed video has one per dub, and
     its plain `en`/`tr` tracks are machine translations of a dub, so a track name alone does not say
-    what is spoken (#277). Candidates are the tracks in the spoken language, a manual one first; when
-    the language is unknown they are a best effort the caller marks as unverified.
-    Returns None without yt-dlp or without an answer.
+    what is spoken (#277). `dublaj` is that evidence: audio or `-orig` tracks in more than one language.
+    Candidates are the tracks in the spoken language, a manual one first; when the language is unknown
+    they are a best effort. Returns None without yt-dlp or without an answer.
     """
     if not found['yt_dlp']:
         return None
@@ -382,7 +384,7 @@ def youtube_tracks(url, found, workdir):
     manual = [key for key in manual if TRACK.fullmatch(key) and key not in ('live_chat', 'all')]
     auto = [key for key in auto if TRACK.fullmatch(key) and heard(key)]
     recognised = [key for key in auto if key.endswith('-orig')]
-    spoken = _spoken(data, recognised)
+    spoken, dubbed = _spoken(data, recognised)
 
     def order(key):
         if not spoken:
@@ -392,7 +394,7 @@ def youtube_tracks(url, found, workdir):
     tracks = []
     for keys, automatic in ((manual, False), (recognised, True), ([key for key in auto if key not in recognised], True)):
         tracks += [(key, automatic) for key in sorted(keys, key=order) if not spoken or _base(key) == _base(spoken)]
-    return {'dil': spoken, 'adaylar': tracks[:3]}
+    return {'dil': spoken, 'dublaj': dubbed, 'adaylar': tracks[:3]}
 
 
 def via_subtitles(found, workdir, track, automatic):
@@ -440,24 +442,25 @@ def via_youtube(url, found, allow_audio=True, info=None):
 
     yt-dlp names the spoken language, Defuddle is asked for that language and its answer is checked.
     A transcript in another language (a dub, a translation) gives way to the yt-dlp track; when that
-    cannot be had it is kept with a warning. Audio stays the last resort for a video with no transcript,
-    and without yt-dlp Defuddle's own pick stands as before. `info` gains `dil` (language of the stored
-    transcript), `altyazi` (yt-dlp track) and `uyari` (set when that language is unverified).
+    cannot be had it is kept. Audio stays the last resort for a video with no transcript, and without
+    yt-dlp Defuddle's own pick stands as before. `info` gains `dil` (language of the stored transcript)
+    and `altyazi` (yt-dlp track). `uyari` is set only on evidence of a problem: a transcript known to be
+    in another language, or a dubbed video whose spoken language is unknown. An unknown language alone
+    (no yt-dlp, no metadata, one audio language without a `language` field) is no such evidence.
     """
     info = {} if info is None else info
     info.update(dil=None, altyazi=None, uyari=None)
     with tempfile.TemporaryDirectory(prefix='beyin-yakala-') as workdir:
         tracks = youtube_tracks(url, found, workdir)
         spoken = tracks['dil'] if tracks else None
-        why = 'yt-dlp kurulu degil' if not found['yt_dlp'] else 'yt-dlp video bilgisini alamadi' if not tracks \
-            else 'video bilgisinde konusma dili yok'
+        unsure = 'Video dublajli gorunuyor ve konusulan dil belirlenemedi; ' if tracks and tracks['dublaj'] and not spoken else None
         text = via_defuddle(url, found, info, spoken)
         section = re.search(r'^## Transcript', text or '', re.M)
         took = info.get('language', '')[:20] if section else None
         if section and (not spoken or _base(took) == _base(spoken)):
             info['dil'] = took
-            if not spoken:
-                info['uyari'] = 'Konusma dili dogrulanamadi (' + why + '); transkript dili: ' + (took or 'bilinmiyor') + '.'
+            if unsure:
+                info['uyari'] = unsure + 'transkript dili: ' + (took or 'bilinmiyor') + '.'
             return text, 'defuddle', info['uyari']
         lead = (text[:section.start()].rstrip() if section else text) or ''
         lead += '\n\n## Transcript\n\n' if lead else ''
@@ -465,14 +468,16 @@ def via_youtube(url, found, allow_audio=True, info=None):
             subtitles = via_subtitles(found, workdir, track, automatic)
             if subtitles:
                 info.update(dil=track.removesuffix('-orig'), altyazi=track + (' (otomatik)' if automatic else ' (elle)'))
-                if not spoken:
-                    info['uyari'] = 'Konusma dili dogrulanamadi (' + why + '); kullanilan altyazi izi: ' + info['altyazi'] + '.'
+                if unsure:
+                    info['uyari'] = unsure + 'kullanilan altyazi izi: ' + info['altyazi'] + '.'
                 return lead + subtitles, 'yt-dlp-altyazi', info['uyari']
         if allow_audio and not section:
             words = via_audio(url, found, workdir)
             if words:
                 info['dil'] = spoken
-                return lead + words, 'ses-whisper', None
+                if unsure:
+                    info['uyari'] = unsure + 'yaziya dokulen ses asil dilde olmayabilir.'
+                return lead + words, 'ses-whisper', info['uyari']
     if section:  # only a transcript in another language could be had: keep it and say so on the card
         info['dil'] = took
         info['uyari'] = ('Transkript konusma dilinde olmayabilir: video ' + spoken + ', transkript ' + (took or 'bilinmiyor') +
@@ -1316,9 +1321,9 @@ Windows'ta komutlardaki `python3` yerine `py -3` yaz.
 - `hata` kartında karttaki `hata` notunu oku ve kullanıcıya ne gerektiğini söyle (sayfa giriş
   istiyorsa Web Clipper ile sayfa açıkken yakalamak, video için `yt-dlp`). Yeniden denemek için
   `python3 beyin.py yakala isle --tekrar`.
-- Video kartında `dil` kaydedilen transkriptin dilidir. `uyari` varsa (konuşma dili doğrulanamadı
-  ya da transkript dublaj/çeviri dilinde) kullanıcıya söyle; `yt-dlp` kuruluysa
-  `python3 beyin.py yakala isle <id>` ile yeniden dene.
+- Video kartında `dil` kaydedilen transkriptin dilidir; `yt-dlp` kurulu değilse bu dil doğrulanamaz.
+  `dil` videoda gerçekten konuşulan dille uyuşmuyorsa kullanıcıya söyle, `yt-dlp` kurmasını ve
+  `python3 beyin.py yakala isle <id>` ile yeniden denemeyi öner. Kartta `uyari` varsa onu da ilet.
 - `visibility: private` kartlardan (mail, pano metni, dosya) çıkan derslerde kişi adı, adres,
   numara gibi kişisel veriyi bilgi notuna taşıma.
 - Kartları ve `.ham/` dosyalarını silme; kullanıcının arşividir.

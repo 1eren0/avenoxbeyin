@@ -82,11 +82,13 @@ izi indirir; elle yazılmış altyazı otomatik olandan önce gelir. Sonuç kart
 
 - `dil`: kaydedilen transkriptin dili.
 - `altyazi`: `yt-dlp` ile alınan iz, örneğin `en-orig (otomatik)` ya da `tr (elle)`.
-- `uyari`: konuşma dili doğrulanamadıysa ya da transkript başka bir dildeyse bunu söyler.
+- `uyari`: yalnız bir sorun belirtisi varsa yazılır: transkript konuşma dilinde alınamadıysa ya da
+  video dublajlıyken (birden çok dilde ses ya da `-orig` izi) konuşulan dil belirlenemediyse.
 
-`yt-dlp` kurulu değilse Defuddle'ın seçtiği transkript eskisi gibi kaydedilir, dili doğrulanamadığı
-için kart `uyari` ile işaretlenir. Uyarılı bir kartı yeniden denemek için
-`python3 beyin.py yakala isle <id>`. Daha önce işlenmiş kartlar değişmez.
+`yt-dlp` kurulu değilse dil doğrulanamaz: Defuddle'ın seçtiği transkript eskisi gibi kaydedilir ve
+dili `dil` alanına yazılır. `dil` videoda konuşulan dil değilse `yt-dlp` kurup
+`python3 beyin.py yakala isle <id>` ile yeniden dene; `uyari` olan kart da aynı komutla yeniden
+denenir. Daha önce işlenmiş kartlar değişmez.
 
 ### İsteğe bağlı araçlar
 

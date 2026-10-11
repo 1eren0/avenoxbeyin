@@ -22,10 +22,10 @@ INBOX = '📥 000-Inbox/Yakala'
 sys.path.insert(0, str(SCRIPTS))
 import beyin_v3_yakala as yakala  # noqa: E402
 
-# Stands in for `npx defuddle` and `yt-dlp` as a real child process. It answers from scenario.json
-# next to it, logs every command line to calls.jsonl and never opens a socket. A subtitle request
-# behaves like yt-dlp: --sub-langs is a comma list of regexes, a manual track wins over an automatic
-# one of the same name, and each matching track becomes sub.<track>.vtt.
+# Stands in for `npx defuddle`, `yt-dlp` and `whisper` as a real child process. It answers from
+# scenario.json next to it, logs every command line to calls.jsonl and never opens a socket. A subtitle
+# request behaves like yt-dlp: --sub-langs is a comma list of regexes, a manual track wins over an
+# automatic one of the same name, and each matching track becomes sub.<track>.vtt.
 FAKE_TOOL = r'''
 import json, re, sys
 from pathlib import Path
@@ -52,6 +52,8 @@ if name == 'npx':
     if not answer:
         raise SystemExit(1)
     sys.stdout.write(json.dumps(answer))
+elif name == 'whisper':
+    Path(value('--output_dir'), 'ses.txt').write_text(scenario['audio'], encoding='utf-8')
 elif '-J' in args:
     if not scenario.get('video'):
         too_many()
@@ -73,6 +75,8 @@ elif '--sub-langs' in args:
             words = scenario.get('speech', {}).get(kind + ':' + track) or (kind + ' track ' + track + ' ') * 8
             Path(value('-o').replace('%(ext)s', track + '.vtt')).write_text(
                 'WEBVTT\nKind: captions\n\n00:00:01.000 --> 00:00:09.000\n' + words + '\n', encoding='utf-8')
+elif '-f' in args and scenario.get('audio'):
+    Path(value('-o').replace('%(ext)s', 'webm')).write_bytes(b'ses')
 else:
     raise SystemExit(1)
 '''
@@ -293,7 +297,8 @@ class YakalaUnitTest(unittest.TestCase):
 
 
 class YakalaVideoLanguageTest(unittest.TestCase):
-    """#277: the stored transcript is in the language spoken in the video, or the card says it is unverified."""
+    """#277: the transcript is in the language spoken in the video; the card names the language it stored
+    and warns only on evidence of a wrong one (a known mismatch, or a dubbed video of unknown language)."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-dil-')
@@ -402,27 +407,61 @@ class YakalaVideoLanguageTest(unittest.TestCase):
         self.assertNotIn('uyari', meta)
         self.assertNotIn(ARABIC, raw)
 
-    def test_no_metadata_language_is_marked_unverified(self):
+    def test_unknown_language_of_a_single_language_video_is_recorded_without_a_warning(self):
         # Like jNQXAC9IVRw: manual tracks only, no speech recognition, so yt-dlp names no language.
+        # Nothing points at a dub, so the stored language on the card is enough.
         scenario = {'video': video(None, audio=[(None, -1)], manual=['de', 'en']), 'defuddle': {'': defuddle('en', ENGLISH)},
                     'speech': {'manual:en': ENGLISH}}
         entry, meta, raw = self.isle(scenario)
         self.assertEqual((entry['yontem'], meta.get('dil')), ('defuddle', 'en'))
-        self.assertIn('Konusma dili dogrulanamadi', meta.get('uyari', ''))
-        self.assertIn('transkript dili: en', meta['uyari'])
-        self.assertEqual(entry['not'], meta['uyari'])
+        self.assertNotIn('uyari', meta)
+        self.assertNotIn('not', entry)
         self.assertNotIn('--lang', self.calls('npx')[0])
         self.assertEqual(self.track_requests(), [])
         # Without Defuddle a track is still taken, and the card names it.
         entry, meta, raw = self.isle(scenario, npx=False)
-        self.assertEqual((entry['yontem'], meta['dil'], meta['altyazi']), ('yt-dlp-altyazi', 'en', 'en (elle)'))
-        self.assertIn('kullanilan altyazi izi: en (elle)', meta['uyari'])
+        self.assertEqual((entry['yontem'], meta.get('dil'), meta.get('altyazi')), ('yt-dlp-altyazi', 'en', 'en (elle)'))
+        self.assertNotIn('uyari', meta)
+        self.assertNotIn('not', entry)
         self.assertEqual(self.track_requests(), [('en', False)])
 
-    def test_refused_metadata_request_leaves_defuddle_unverified(self):
+    def test_unknown_language_of_a_dubbed_video_warns(self):
+        # Two audio languages and neither marked original: whatever is stored may be a dub.
+        scenario = {'video': video('tr', audio=[('tr', 5), ('en', -1)], recognised=['en-orig', 'tr-orig'], translated=['de']),
+                    'defuddle': {'': defuddle('en', ENGLISH)}}
+        entry, meta, raw = self.isle(scenario)
+        self.assertEqual((entry['yontem'], meta.get('dil')), ('defuddle', 'en'))
+        for part in ('dublajli', 'konusulan dil belirlenemedi', 'transkript dili: en'):
+            self.assertIn(part, meta.get('uyari', ''))
+        self.assertEqual(entry['not'], meta['uyari'])
+        self.assertNotIn('--lang', self.calls('npx')[0])
+        # No audio language at all, but speech recognised in two languages: the track taken is named.
+        scenario = {'video': video(None, recognised=['en-orig', 'tr-orig']), 'speech': {'auto:tr-orig': TURKISH}}
+        entry, meta, raw = self.isle(scenario, npx=False)
+        self.assertEqual((entry['yontem'], meta.get('dil'), meta.get('altyazi')), ('yt-dlp-altyazi', 'tr', 'tr-orig (otomatik)'))
+        for part in ('dublajli', 'kullanilan altyazi izi: tr-orig (otomatik)'):
+            self.assertIn(part, meta.get('uyari', ''))
+        self.assertEqual(self.track_requests(), [('tr-orig', True)])
+
+    def test_audio_fallback_warns_only_for_a_dubbed_video_of_unknown_language(self):
+        # No captions of any kind: the audio is transcribed. With two audio languages and no original it may be a dub.
+        scenario = {'video': video(None, audio=[('tr', 5), ('en', -1)]), 'audio': TURKISH}
+        entry, meta, raw = self.isle(scenario, npx=False, whisper=True)
+        self.assertEqual((entry['durum'], entry.get('yontem')), ('cikarildi', 'ses-whisper'))
+        self.assertIn(TURKISH, raw)
+        for part in ('dublajli', 'ses asil dilde olmayabilir'):
+            self.assertIn(part, meta.get('uyari', ''))
+        self.assertNotIn('dil', meta)
+        # One audio language: its transcript is the spoken language, nothing to warn about.
+        entry, meta, raw = self.isle(dict(scenario, video=video('tr', audio=[('tr', -1)])), npx=False, whisper=True)
+        self.assertEqual((entry['yontem'], meta.get('dil'), meta.get('uyari')), ('ses-whisper', 'tr', None))
+        self.assertNotIn('not', entry)
+
+    def test_refused_metadata_request_keeps_defuddle_and_asks_for_no_track(self):
         entry, meta, raw = self.isle({'video': None, 'defuddle': {'': defuddle('ar', ARABIC)}})
         self.assertEqual((entry['yontem'], meta.get('dil')), ('defuddle', 'ar'))
-        self.assertIn('yt-dlp video bilgisini alamadi', meta.get('uyari', ''))
+        self.assertNotIn('uyari', meta)  # an unanswered request is no evidence of a dub
+        self.assertNotIn('not', entry)
         self.assertEqual(self.track_requests(), [])  # no blind request for tracks it could not list
         self.assertEqual(len(self.calls('yt-dlp')), 1)
 
@@ -445,12 +484,13 @@ class YakalaVideoLanguageTest(unittest.TestCase):
         self.assertEqual((entry['yontem'], meta['dil'], meta.get('altyazi'), meta.get('uyari')), ('defuddle', 'tr', None, None))
         self.assertEqual(self.track_requests(), [])
 
-    def test_without_ytdlp_defuddle_stands_and_is_marked_unverified(self):
+    def test_without_ytdlp_defuddle_stands_and_its_language_is_recorded(self):
         entry, meta, raw = self.isle({'defuddle': {'': defuddle('ar', ARABIC)}}, yt_dlp=False)
         self.assertEqual((entry['durum'], entry['yontem']), ('cikarildi', 'defuddle'))
         self.assertIn(ARABIC, raw)  # as before: there is nothing to check it against
-        self.assertEqual(meta.get('dil'), 'ar')
-        self.assertIn('yt-dlp kurulu degil', meta.get('uyari', ''))
+        self.assertEqual((meta.get('dil'), entry.get('dil')), ('ar', 'ar'))  # visible on the card, which is enough
+        self.assertNotIn('uyari', meta)
+        self.assertNotIn('not', entry)
         self.assertEqual(self.calls('yt-dlp'), [])
         self.assertNotIn('--lang', self.calls('npx')[0])
         # No transcript and no yt-dlp: the old note, no language claim.
@@ -462,16 +502,28 @@ class YakalaVideoLanguageTest(unittest.TestCase):
         def tracks(data):
             with tempfile.TemporaryDirectory() as work, patch.object(yakala, '_run', return_value=(0, json.dumps(data), '')):
                 return yakala.youtube_tracks(VIDEO, {'yt_dlp': 'yt-dlp'}, work)
-        self.assertEqual(tracks(dubbed()), {'dil': 'en-US', 'adaylar': [('en-orig', True)]})
+        self.assertEqual(tracks(dubbed()), {'dil': 'en-US', 'dublaj': True, 'adaylar': [('en-orig', True)]})
         # Region codes: the exact track, then the bare language, then another region; a manual one first.
         german = video('de-DE', audio=[('de-DE', -1)], manual=['de', 'en'], recognised=['de-DE-orig', 'de-DE', 'de-orig'], translated=['de'])
-        self.assertEqual(tracks(german), {'dil': 'de-DE', 'adaylar': [('de', False), ('de-DE-orig', True), ('de-orig', True)]})
+        self.assertEqual(tracks(german), {'dil': 'de-DE', 'dublaj': False,
+                                          'adaylar': [('de', False), ('de-DE-orig', True), ('de-orig', True)]})
         # No `language`, one recognised track: that is what is spoken.
         self.assertEqual(tracks(video(None, recognised=['ja-orig', 'ja'], translated=['en', 'tr'])),
-                         {'dil': 'ja', 'adaylar': [('ja-orig', True), ('ja', True)]})
+                         {'dil': 'ja', 'dublaj': False, 'adaylar': [('ja-orig', True), ('ja', True)]})
         # Several audio languages and none marked original: nothing to go on, Turkish and English first.
         unmarked = video('tr', audio=[('tr', 5), ('en', -1), ('en-desc', -10)], recognised=['en-orig', 'tr-orig', 'ar-orig'], translated=['de'])
-        self.assertEqual(tracks(unmarked), {'dil': None, 'adaylar': [('tr-orig', True), ('en-orig', True), ('ar-orig', True)]})
+        self.assertEqual(tracks(unmarked), {'dil': None, 'dublaj': True,
+                                            'adaylar': [('tr-orig', True), ('en-orig', True), ('ar-orig', True)]})
+        # Evidence of a dub, each kind alone: two audio languages, or speech recognised in two languages.
+        self.assertEqual(tracks(video(None, audio=[('tr', 5), ('en', -1)])), {'dil': None, 'dublaj': True, 'adaylar': []})
+        self.assertEqual(tracks(video(None, recognised=['en-orig', 'tr-orig'])),
+                         {'dil': None, 'dublaj': True, 'adaylar': [('tr-orig', True), ('en-orig', True)]})
+        # No evidence: one language throughout. An audio description (`en-desc`) and a second recognised
+        # track of the same language are not dubs, and neither is a video that names no language at all.
+        described = video(None, audio=[('en', -1), ('en-desc', -10)], recognised=['en-orig', 'en-US-orig'])
+        self.assertEqual(tracks(described), {'dil': None, 'dublaj': False, 'adaylar': [('en-US-orig', True), ('en-orig', True)]})
+        self.assertEqual(tracks(video(None, audio=[(None, -1)], manual=['de', 'en'])),
+                         {'dil': None, 'dublaj': False, 'adaylar': [('en', False), ('de', False)]})
         # A language that is not a language code is not passed on to a command line.
         self.assertIsNone(tracks(video('--evil', recognised=['en-orig', 'tr-orig']))['dil'])
         odd = video('en', manual=['live_chat', 'all', '-en', 'en.*', 'en'], recognised=['en-orig'])
