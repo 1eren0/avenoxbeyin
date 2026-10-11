@@ -96,6 +96,17 @@ def migration_guard(vault_root, state_dir):
     with ExitStack() as stack:
         if legacy.exists():
             now = time.time()
+            if legacy.is_dir():
+                # pathlib's glob swallows a directory it may not read and yields nothing, which
+                # would wave an unseen writer through and record an empty legacy state.
+                try:
+                    os.listdir(legacy)
+                    searchable = os.access(legacy, os.X_OK)
+                except OSError:
+                    searchable = False
+                if not searchable:
+                    raise RuntimeError('legacy writer state directory ' + legacy.relative_to(vault).as_posix() +
+                                       ' cannot be read; make it readable for this user, then rerun')
             held = set()
             for path in sorted(legacy.glob('*.lock')):
                 relative = path.relative_to(vault).as_posix()
@@ -140,7 +151,11 @@ def migration_guard(vault_root, state_dir):
                 try:
                     item = json.loads(path.read_text(encoding='utf-8'))
                 except (ValueError, UnicodeError):
-                    raise RuntimeError('legacy writer state unreadable; review locally')
+                    raise RuntimeError('legacy writer state unreadable in ' + path.relative_to(vault).as_posix() + '; review locally')
+                except OSError as exc:
+                    raise RuntimeError('legacy writer state in ' + path.relative_to(vault).as_posix() + ' cannot be read (' +
+                                       (exc.strerror or type(exc).__name__) +
+                                       '); make it a readable file for this user or review it locally, then rerun') from exc
                 if isinstance(item, dict) and any(item.get(key) in ('inflight', 'running', 'pending') for key in ('status', 'state')):
                     relative = path.relative_to(vault).as_posix()
                     # Every V2 release that writes status "inflight" to flush-<key>.json takes

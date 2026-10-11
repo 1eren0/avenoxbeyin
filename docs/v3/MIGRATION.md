@@ -48,9 +48,10 @@ Everything else still blocks:
   session is running, it is a leftover: remove that empty directory yourself
   and rerun.
 - A `*.lock` entry that is neither a regular file nor such a directory (another
-  directory, a non-empty one, a symlink, a FIFO), or a lock this user may not
-  open: the error names the path. Fix its permissions, or move a foreign entry
-  out of `.claude/scripts/.state`, and rerun.
+  directory, a non-empty one, a symlink, a FIFO), or a lock, a writer record or
+  the state directory itself that this user may not read: the error names the
+  path. Fix its permissions, or move a foreign entry out of
+  `.claude/scripts/.state`, and rerun.
 - A flush sentinel without a `flush-<key>.lock` of the same name, a `pending` or
   `running` state, or a record of another writer (`compile-state.json`,
   `antigravity-<key>.json`): a free lock proves nothing about these, and the
@@ -227,8 +228,8 @@ covers a session.
 
 Synthetic tests cover byte preservation, idempotent watermarking, inflight
 rejection, lock-proven orphaned sentinels (one test drives the stock V2 flush
-itself on POSIX), stale and fresh prompt-counter lock directories, foreign and
-unreadable lock entries, concurrent source-edit detection, private Companion
+itself on POSIX), stale and fresh prompt-counter lock directories, unreadable
+lock and state entries, concurrent source-edit detection, private Companion
 filtering, new-only outcome projections, manual-view conflicts, note-create
 refusal to overwrite, and receipt-gap closure. Actual V2 workers, external
 schedules and client trust still require environment-specific validation. A

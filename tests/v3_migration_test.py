@@ -301,6 +301,43 @@ class MigrationTest(unittest.TestCase):
         self.assertNotIn(self.temp.name, str(raised.exception))
         self.assertFalse((self.state / 'v2-migration.json').exists())
 
+    @unittest.skipUnless(os.name == 'posix', 'directory permission bits')
+    def test_state_directory_that_cannot_be_read_blocks_instead_of_passing_unseen(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads a directory whatever its mode')
+        # A listing that fails used to look like an empty directory: the writer inside went
+        # unseen and the cutover recorded no legacy state at all.
+        sentinel = self.source('.claude/scripts/.state/flush-example.json', flush_record(age=0))
+        self.source('.claude/scripts/.state/flush-example.lock', '')
+        legacy = sentinel.parent
+        self.addCleanup(legacy.chmod, 0o755)
+        for mode in (0o000, 0o311, 0o444):
+            with self.subTest(mode=oct(mode)):
+                legacy.chmod(mode)
+                with self.assertRaisesRegex(RuntimeError, r'legacy writer state directory \.claude/scripts/\.state cannot be read;'
+                                                          r' make it readable for this user, then rerun'):
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+        # Reading is all the guard needs: a read-only state directory is not an obstacle.
+        legacy.chmod(0o755)
+        sentinel.write_bytes(flush_record().encode('utf-8'))
+        legacy.chmod(0o555)
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
+
+    def test_writer_record_that_cannot_be_read_blocks_with_its_path(self):
+        record = self.root / '.claude/scripts/.state/flush-example.json'
+        record.mkdir(parents=True)  # reading it fails on every platform
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer state in \.claude/scripts/\.state/flush-example\.json cannot be read'
+                                                  r' \(.+\); make it a readable file for this user') as raised:
+            self.m.migrate_v2(self.root, self.state)
+        self.assertNotIn(self.temp.name, str(raised.exception))
+        record.rmdir()
+        record.write_bytes(b'{"status": "infl')
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer state unreadable in \.claude/scripts/\.state/flush-example\.json; review locally'):
+            self.m.migrate_v2(self.root, self.state)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
     def test_legacy_lock_is_guarded_but_excluded_from_inventory(self):
         lock = self.source('.claude/scripts/.state/compile.lock', '')
         state_file = self.source('.claude/scripts/.state/compile-state.json', '{"status":"ok"}')
