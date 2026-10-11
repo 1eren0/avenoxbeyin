@@ -28,8 +28,8 @@ sentinel does not block: the file is preserved as it is and its path is listed a
 `orphaned_legacy_state` in the installer result and, at the first cutover, in
 `v2-migration.json`. The summary it was writing most likely never reached
 `daily/`. The same holds on every later `update` for a flush kept with
-`--keep-customized-legacy`; the `update` result lists those sentinels and its
-message counts them.
+`--keep-customized-legacy`; the `update` result lists, and its message counts,
+the sentinels that the cutover receipt does not already name.
 
 Everything else still blocks:
 

@@ -443,9 +443,15 @@ def update(vault, state, package=None, check=False):
         if plan.get('manifest', {}).get('excluded_components'):
             result['excluded_components'] = plan['manifest']['excluded_components']
         # A kept V2 flush that died mid-summary: the guard let its sentinel through on proof,
-        # but nothing else would ever tell the user that session's summary is missing.
+        # but nothing else would ever tell the user that session's summary is missing. Sentinels
+        # the cutover receipt already lists were reported by that install and never change again
+        # once the flush is retired, so repeating them here would follow every update forever.
         if migration and migration[1].get('orphaned_legacy_state'):
-            result['orphaned_legacy_state'] = migration[1]['orphaned_legacy_state']
+            receipt = migration[1].get('previous')
+            reported = set(receipt.get('orphaned_legacy_state') or []) if isinstance(receipt, dict) else set()
+            later = [name for name in migration[1]['orphaned_legacy_state'] if name not in reported]
+            if later:
+                result['orphaned_legacy_state'] = later
         return result
 
 

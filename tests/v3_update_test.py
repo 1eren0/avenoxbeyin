@@ -131,6 +131,30 @@ class OfflineUpdateTest(unittest.TestCase):
         self.assertEqual(snapshot(self.vault), before)
         self.assertFalse((self.state / 'update-journal.json').exists())
 
+    def test_update_does_not_repeat_sentinels_the_cutover_receipt_lists(self):
+        # After a cutover that retired flush nothing ever rewrites its dead sentinels: a note
+        # about them on every later update would never stop. Only a later one is news.
+        self.vault = self.base / 'Synthetic Vault Devir'
+        self.vault.mkdir()
+        self.state = self.base / 'runtime-devir'
+        self.orphaned_flush('flush-before')
+        installed = install(self.vault, self.state, self.env)
+        self.assertEqual(installed.returncode, 0, installed.stderr.decode('utf-8', errors='replace'))
+        recorded = ['.claude/scripts/.state/flush-before.json']
+        self.assertEqual(json.loads(installed.stdout)['orphaned_legacy_state'], recorded)
+        receipt = (self.state / 'v2-migration.json').read_bytes()
+        self.assertEqual(json.loads(receipt)['orphaned_legacy_state'], recorded)
+        self.orphaned_flush('flush-later')
+        report = self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(report['status'], 'updated')
+        self.assertEqual(report['orphaned_legacy_state'], ['.claude/scripts/.state/flush-later.json'])
+        self.assertEqual((self.state / 'v2-migration.json').read_bytes(), receipt)
+        self.assertEqual(self.module.rollback(self.vault, self.state)['status'], 'rolled_back')
+        (self.vault / '.claude/scripts/.state/flush-later.json').unlink()
+        again = self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(again['status'], 'updated')
+        self.assertNotIn('orphaned_legacy_state', again)
+
     def test_update_message_counts_orphaned_flush_sentinels(self):
         spec = importlib.util.spec_from_file_location('update_test_entry_cli', ROOT / 'scripts/beyin_entry.py')
         entry = importlib.util.module_from_spec(spec)
@@ -138,7 +162,9 @@ class OfflineUpdateTest(unittest.TestCase):
         report = {'status': 'updated', 'from_version': '3.0.0', 'version': '3.0.1'}
         self.assertNotIn('flush', entry.human_result(report, 'update'))
         message = entry.human_result(dict(report, orphaned_legacy_state=['a.json', 'b.json']), 'update')
-        self.assertIn('2 V2 flush kaydi inflight kalmis', message)
+        self.assertIn('Yarida kesilmis 2 V2 flush kaydi var (durumu inflight', message)
+        self.assertIn('daily/ altina yazilmamis olabilir', message)
+        self.assertTrue(message.isascii())
 
     def test_update_lock_does_not_create_empty_sqlite_file(self):
         import sqlite3
