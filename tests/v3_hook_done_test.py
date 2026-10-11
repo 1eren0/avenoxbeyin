@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -133,6 +134,20 @@ class HookDoneLedgerTest(unittest.TestCase):
                    "session_id": "synthetic", "prompt": ""}
         self.assertEqual(hook.enqueue_event(self.vault, self.state, payload, "claude"), key)
         self.assertEqual(list((self.state / "hook-queue").glob("*.json")), [])
+
+    def test_doctor_cli_preserves_archived_lifecycle(self):
+        self.marker("old-claude", harness="claude", event="SessionStart")
+        self.marker("recent-codex", harness="codex", event="Stop", old=False)
+        self.assertEqual(ledger.prune(self.store), 1)
+        process = subprocess.run(
+            [sys.executable, str(ROOT / "scripts/beyin_v3.py"), "--vault", str(self.vault),
+             "--state", str(self.state), "doctor"],
+            capture_output=True, text=True, encoding="utf-8", timeout=30)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        report = json.loads(process.stdout)
+        self.assertEqual(report["acknowledged_events"], 2)
+        self.assertEqual(report["lifecycle"]["claude"]["events"], ["SessionStart"])
+        self.assertEqual(report["lifecycle"]["codex"]["events"], ["Stop"])
 
     def test_doctor_reports_legacy_recent_and_archived_history(self):
         _old_key, _old = self.marker("archive", harness="claude", event="SessionStart")
