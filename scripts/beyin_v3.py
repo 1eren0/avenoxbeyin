@@ -712,17 +712,14 @@ def main(argv=None, return_result=False):
                                                           provider=args.provider, laya=laya or None))
                 result["changed"] = True
         elif args.command == "doctor":
+            _ensure_scripts_path()
+            from beyin_v3_hook_done import summary as hook_done_summary
+            done = hook_done_summary(state, ('codex', 'claude', 'antigravity', 'hermes', 'opencode', 'omp'))
             result = {"pending_events": len(list((state / "hook-queue").glob("*.json"))),
-                      "acknowledged_events": len(list((state / "hook-done").glob("*.json")))}
+                      **done}
             for filename in ("hook-health.json", "hook-error.json", "receipt-gaps.json"):
                 path = state / filename
                 result[filename] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
-            seen = {name: set() for name in ('codex', 'claude', 'antigravity', 'hermes', 'opencode', 'omp')}
-            for path in (state/'hook-done').glob('*.json'):
-                event = json.loads(path.read_text(encoding='utf-8'))
-                if event.get('harness') in seen:
-                    seen[event['harness']].add(event.get('event', 'unknown'))
-            result['lifecycle'] = {name: {'status': 'observed_metadata' if events else 'never_seen', 'events': sorted(events)} for name, events in seen.items()}
             result['legacy_external_schedules'] = 'not_inspected; review custom OS/compiler schedules before migration'
             try:  # information only: a stale-path report must never hide the rest of doctor
                 result['hook_paths'] = hook_paths(vault)
