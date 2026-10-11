@@ -154,9 +154,10 @@ class HookDoneLedgerTest(unittest.TestCase):
         self.assertEqual(result["failed"], 0)
         done_file = self.done / (key + ".json")
         self.assertTrue(done_file.exists())
-        stamp = time.time() - ledger.RETENTION_SECONDS - 60
-        os.utime(done_file, (stamp, stamp))
-        self.assertEqual(ledger.prune(self.store), 1)
+        # The successful drain performed a fresh retention scan. Simulate the
+        # next week rather than bypassing the daily scan marker.
+        future = time.time() + ledger.RETENTION_SECONDS + 60
+        self.assertEqual(ledger.prune(self.store, now=future), 1)
         self.assertFalse(done_file.exists())
         self.assertEqual(hook.enqueue_event(self.vault, self.state, payload, "claude"), key)
         self.assertEqual(list((self.state / "hook-queue").glob("*.json")), [])
