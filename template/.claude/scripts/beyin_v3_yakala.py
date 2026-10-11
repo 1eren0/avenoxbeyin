@@ -350,9 +350,15 @@ def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, 
     """Write one card; a repeated URL only gains the new reason. No network."""
     vault = Path(vault)
     url = (url or '').strip() or None
+    text = (text or '').strip() or None
+    if not url and text and re.fullmatch(r'https?://\S+', text):  # a copied link is a source, not a selection
+        try:
+            _safe_source_url(text)
+            url, text = text, None
+        except ValueError:
+            pass  # a local or malformed link stays what it was: copied text, never fetched
     if url:
         _safe_source_url(url)  # Capturing stays offline.
-    text = (text or '').strip() or None
     why = (why or '').strip()
     files = [Path(f).expanduser() for f in files]
     if not (url or text or files):

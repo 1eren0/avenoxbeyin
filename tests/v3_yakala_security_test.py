@@ -36,6 +36,15 @@ class YakalaSecurityTest(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 yakala.capture(self.vault, url=url)
 
+    def test_copied_bare_link_becomes_a_source_only_when_it_is_safe(self):
+        result = yakala.capture(self.vault, text='  https://www.youtube.com/watch?v=abc\n', app='brave')
+        meta = yakala.find_card(self.vault, result['id'])['meta']
+        self.assertEqual((meta['kaynak_turu'], meta['url']), ('youtube', 'https://www.youtube.com/watch?v=abc'))
+        for text in ('http://localhost:8080/panel', 'http://10.0.0.1/', 'bak https://example.com guzel'):
+            with self.subTest(text=text):
+                card = yakala.find_card(self.vault, yakala.capture(self.vault, text=text)['id'])
+                self.assertEqual((card['meta']['kaynak_turu'], card['meta'].get('url')), ('metin', None))
+
     def test_hand_edited_card_rejects_bad_url_before_helper(self):
         new = yakala.capture(self.vault, url='https://example.com/page')
         card = yakala.find_card(self.vault, new['id'])
