@@ -24,9 +24,11 @@ class SingleTermStrictTest(unittest.TestCase):
         path = self.vault / source
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
-        self.store.ingest(dict(id=ident, kind="note", status="active", visibility="internal",
-                               text=text, facts={}, source=source,
-                               updated_at="2026-10-11T10:00:00Z", **kwargs))
+        record = dict(id=ident, kind="note", status="active", visibility="internal",
+                      text=text, facts={}, source=source,
+                      updated_at="2026-10-11T10:00:00Z")
+        record.update(kwargs)
+        self.store.ingest(record)
 
     def ids(self, query, passages=False, **kwargs):
         if passages:
