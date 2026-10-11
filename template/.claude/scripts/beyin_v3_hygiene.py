@@ -113,8 +113,13 @@ def _nfc(name):
 
 
 def sensitive_excluded(name):
-    """True when a top-level folder name carries a kasa-class word (any position, any case/normal form)."""
+    """True when a directory name carries a kasa-class word (any position, any case/normal form)."""
     return any(SENSITIVE_WORDS.fullmatch(word) for word in _name_words(name))
+
+
+def sensitive_source(source):
+    """A vault-relative source inside a sensitive folder must not enter the memory index or context."""
+    return isinstance(source, str) and any(sensitive_excluded(part) for part in Path(source).parts[:-1])
 
 
 def _archive(name):
@@ -638,8 +643,8 @@ def boundary(vault):
     if kasa:
         report['sensitive_excluded'] = kasa
         report['findings'].append('kasa_excluded: ' + ', '.join(kasa) +
-                                  '; hygiene scans skip these folders, automatic context still follows'
-                                  ' visibility metadata - mark their sources visibility: private for the full guarantee.')
+                                  '; sync and automatic context skip these folders. Use'
+                                  ' visibility: private for additional protection when moving notes.')
     parent = vault.parent
     if (parent / '.obsidian').is_dir():
         report['findings'].append('parent_obsidian_index: parent directory also holds a .obsidian vault root; '
