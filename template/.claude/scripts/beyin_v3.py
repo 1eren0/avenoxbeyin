@@ -859,9 +859,11 @@ class MemoryStore:
         return weighted
 
     def _strict_rank(self, ranked, terms, vocabularies):
-        """Keep only meaningful lexical matches; see STRICT_* for the calibrated rules."""
+        """Keep meaningful matches without making one-word queries impossible."""
+        min_shared = min(self.STRICT_MIN_SHARED, len(terms))
+        min_weight = self.STRICT_SINGLE_TERM_MIN_WEIGHT if len(terms) == 1 else self.STRICT_MIN_WEIGHT
         return self._by_weight([(weight, record) for weight, shared_count, record in self._lexical_weights(ranked, terms, vocabularies)
-                                if shared_count >= self.STRICT_MIN_SHARED and weight >= self.STRICT_MIN_WEIGHT])
+                                if shared_count >= min_shared and weight >= min_weight])
 
     BM25_K1 = 1.5
     BM25_B = 0.75
@@ -897,6 +899,8 @@ class MemoryStore:
     # relevant 0.33-1.21; 0.30 silenced 6/7 irrelevant and kept 7/7 relevant.
     STRICT_MIN_SHARED = 2
     STRICT_MIN_WEIGHT = 0.30
+    # A single query term cannot meet the two-term gate; still exclude incidental long-note hits.
+    STRICT_SINGLE_TERM_MIN_WEIGHT = 0.20
     STRICT_EXCLUDE = ("daily/",)  # session logs are records, not knowledge; they match everything
 
     # Per-turn strict context ranks Markdown passages instead of whole notes and delivers the
