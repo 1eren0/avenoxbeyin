@@ -601,7 +601,8 @@ class PopupWiringTest(ScreenshotFiles, unittest.TestCase):
         return yakala.find_card(self.vault, result['id'])
 
     def saved_files(self):
-        return sorted((self.vault / INBOX / 'dosyalar').glob('*')) if (self.vault / INBOX / 'dosyalar').is_dir() else []
+        # Only what a capture copied in: the folder may also hold housekeeping dot files.
+        return sorted(path for path in (self.vault / INBOX / 'dosyalar').glob('*') if not path.name.startswith('.'))
 
     def test_screenshot_becomes_a_file_card_without_the_temp_path(self):
         result, root, _ = self.popup(self.shot_file(age=40), self.bitmap, [('look', None), ('type', 'hata ekranı'), ('key', '<Return>')])
