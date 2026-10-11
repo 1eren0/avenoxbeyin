@@ -4,7 +4,9 @@ Offline: `isle` runs with every helper tool hidden, so nothing reaches the netwo
 popup/hotkey paths are never started.
 """
 import json
+import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -12,12 +14,107 @@ import unittest
 from unittest.mock import patch
 
 from v3_package_helpers import inherited_env
+from v3_package_helpers import clean_environ, isolated_path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'template/.claude/scripts'
 INBOX = '📥 000-Inbox/Yakala'
 sys.path.insert(0, str(SCRIPTS))
 import beyin_v3_yakala as yakala  # noqa: E402
+
+# Stands in for `npx defuddle` and `yt-dlp` as a real child process. It answers from scenario.json
+# next to it, logs every command line to calls.jsonl and never opens a socket. A subtitle request
+# behaves like yt-dlp: --sub-langs is a comma list of regexes, a manual track wins over an automatic
+# one of the same name, and each matching track becomes sub.<track>.vtt.
+FAKE_TOOL = r'''
+import json, re, sys
+from pathlib import Path
+
+here = Path(__file__).resolve().parent
+name, args = sys.argv[1], sys.argv[2:]
+scenario = json.loads((here / 'scenario.json').read_text(encoding='utf-8'))
+with open(here / 'calls.jsonl', 'a', encoding='utf-8') as log:
+    log.write(json.dumps([name] + args) + '\n')
+
+
+def value(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+def too_many():
+    sys.stderr.write('ERROR: Unable to download video subtitles: HTTP Error 429: Too Many Requests\n')
+    raise SystemExit(1)
+
+
+if name == 'npx':
+    answers = scenario.get('defuddle') or {}
+    answer = answers.get(value('--lang') or '', answers.get(''))
+    if not answer:
+        raise SystemExit(1)
+    sys.stdout.write(json.dumps(answer))
+elif '-J' in args:
+    if not scenario.get('video'):
+        too_many()
+    sys.stdout.write(json.dumps(scenario['video']))
+elif '--sub-langs' in args:
+    if '--load-info-json' in args:
+        json.loads(Path(value('--load-info-json')).read_text(encoding='utf-8'))
+    video, offered = scenario.get('video') or {}, {}
+    if '--write-subs' in args:
+        offered.update({track: 'manual' for track in video.get('subtitles') or {}})
+    if '--write-auto-subs' in args:
+        for track in video.get('automatic_captions') or {}:
+            offered.setdefault(track, 'auto')
+    earlier = sum('--sub-langs' in json.loads(line) for line in (here / 'calls.jsonl').read_text(encoding='utf-8').splitlines()) - 1
+    if earlier < scenario.get('fail_first', 0):
+        too_many()
+    for track, kind in offered.items():
+        if any(re.fullmatch(pattern, track) for pattern in value('--sub-langs').split(',')):
+            words = scenario.get('speech', {}).get(kind + ':' + track) or (kind + ' track ' + track + ' ') * 8
+            Path(value('-o').replace('%(ext)s', track + '.vtt')).write_text(
+                'WEBVTT\nKind: captions\n\n00:00:01.000 --> 00:00:09.000\n' + words + '\n', encoding='utf-8')
+else:
+    raise SystemExit(1)
+'''
+
+VIDEO = 'https://www.youtube.com/watch?v=Wqq0mwYmhcQ'
+DUBS = ('ar', 'bn', 'de-DE', 'es-US', 'fr-FR', 'hi', 'id', 'it', 'iw', 'ja', 'ko', 'ml', 'nl-NL', 'pa', 'pl', 'pt-BR',
+        'ru', 'ta', 'te', 'uk')
+ENGLISH = 'So, I gave the same prompt to both models across four different builds and wrote down what every run cost.'
+ARABIC = 'لذا، قمتُ بتطبيق نفس التعليمات على النموذجين في أربع تجارب مختلفة، ثم سجّلتُ تكلفة كل تجربة منها بالتفصيل.'
+TURKISH = 'Aynı istemi iki modele de verdim; ölçtüğüm maliyeti şöyle yazdım: İstanbul, Iğdır, Çorum, Şırnak, Ödemiş, Ünye.'
+
+
+def caption(source, target=None):
+    """One automatic caption entry as yt-dlp lists it; `tlang` marks a machine translation of `source`."""
+    url = 'https://www.youtube.com/api/timedtext?v=Wqq0mwYmhcQ&kind=asr&lang=' + source + ('&tlang=' + target if target else '')
+    return [{'ext': ext, 'url': url + '&fmt=' + ext} for ext in ('json3', 'vtt')]
+
+
+def video(language=None, audio=(), manual=(), recognised=(), translated=()):
+    """The part of a `yt-dlp -J` answer the capture reads. `audio` is (language, language_preference) pairs."""
+    automatic = {track: caption(track.removesuffix('-orig')) for track in recognised}
+    for track in translated:  # the untranslated entry, if any, comes first; yt-dlp takes the last one
+        automatic[track] = automatic.get(track, []) + caption('uk', track)
+    return {'id': 'Wqq0mwYmhcQ', 'title': 'I Tested Two Models', 'language': language,
+            'formats': [{'format_id': '251-' + str(index), 'acodec': 'opus', 'language': code, 'language_preference': mark}
+                        for index, (code, mark) in enumerate(audio)],
+            'subtitles': {track: [{'ext': 'vtt', 'url': 'https://www.youtube.com/api/timedtext?lang=' + track}] for track in manual},
+            'automatic_captions': automatic}
+
+
+def dubbed():
+    """Like the video in #277: spoken English, 20 automatic dubs, one `-orig` track per audio track."""
+    return video('en-US', audio=[('en-US', 10)] + [(code, -1) for code in DUBS],
+                 recognised=['en', 'en-orig'] + [code + '-orig' for code in DUBS],
+                 translated=['en', 'tr'] + [code for code in DUBS])
+
+
+def defuddle(language, words=None):
+    """A `defuddle parse --json` answer; without words the video has no transcript, only its description."""
+    body = '## Transcript\n\n### Intro\n\n**0:00** · ' + words if words else 'Video description without a transcript. ' * 4
+    return {'title': 'I Tested Two Models', 'author': 'Kanal', 'published': '2026-09-16T05:37:48-07:00', 'site': 'YouTube',
+            'language': language, 'content': '![](' + VIDEO + ')\n\n' + body}
 
 
 class YakalaUnitTest(unittest.TestCase):
@@ -195,6 +292,197 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertEqual(yakala.pending(self.vault), 1)
 
 
+class YakalaVideoLanguageTest(unittest.TestCase):
+    """#277: the stored transcript is in the language spoken in the video, or the card says it is unverified."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-dil-')
+        self.addCleanup(self.tmp.cleanup)
+        self.vault, self.bin = Path(self.tmp.name) / 'Örnek Beyin', Path(self.tmp.name) / 'bin'
+        self.vault.mkdir()
+        self.bin.mkdir()
+        (self.bin / 'fake_tool.py').write_text(FAKE_TOOL, encoding='utf-8')
+        environ = clean_environ()
+        environ.start()
+        self.addCleanup(environ.stop)
+        real_run = yakala._run
+
+        def run(command, timeout, cwd=None):  # the real subprocess call, aimed at the stand-in
+            self.assertGreater(timeout, 0)
+            return real_run([sys.executable, str(self.bin / 'fake_tool.py'), Path(command[0]).name, *command[1:]], timeout, cwd)
+        patcher = patch.object(yakala, '_run', run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def isle(self, scenario, npx=True, yt_dlp=True, whisper=False, url=VIDEO, **options):
+        """Capture `url` once, process the queue against `scenario`; returns (result entry, card meta, raw text)."""
+        (self.bin / 'scenario.json').write_text(json.dumps(scenario), encoding='utf-8')
+        (self.bin / 'calls.jsonl').write_text('', encoding='utf-8')
+        found = {'npx': 'npx' if npx else None, 'yt_dlp': 'yt-dlp' if yt_dlp else None,
+                 'whisper': 'whisper' if whisper else None, 'pdftotext': None, 'ffmpeg': None}
+        card = next((card['id'] for card in yakala.cards(self.vault) if card['meta'].get('url') == url), None) \
+            or yakala.capture(self.vault, url=url)['id']
+        with patch.object(yakala, 'tools', return_value=found):
+            entry = yakala.process(self.vault, [card], **options)['kartlar'][0]
+        raw = (self.vault / entry['ham']).read_text(encoding='utf-8') if entry.get('ham') else ''
+        return entry, yakala.find_card(self.vault, card)['meta'], raw
+
+    def calls(self, tool=None):
+        lines = (self.bin / 'calls.jsonl').read_text(encoding='utf-8').splitlines()
+        return [call for call in map(json.loads, lines) if tool in (None, call[0])]
+
+    def track_requests(self):
+        """What each yt-dlp subtitle request asked for: (--sub-langs value, automatic?)."""
+        return [(call[call.index('--sub-langs') + 1], '--write-auto-subs' in call) for call in self.calls('yt-dlp')
+                if '--sub-langs' in call]
+
+    def test_dubbed_video_asks_defuddle_for_the_spoken_language(self):
+        answers = {'': defuddle('ar', ARABIC), 'en-US': defuddle('en', ENGLISH)}
+        entry, meta, raw = self.isle({'video': dubbed(), 'defuddle': answers})
+        self.assertIn(ENGLISH, raw)
+        self.assertNotIn(ARABIC, raw)
+        self.assertEqual((entry['durum'], entry['yontem'], entry['dil']), ('cikarildi', 'defuddle', 'en'))
+        self.assertEqual(meta['dil'], 'en')
+        self.assertNotIn('uyari', meta)
+        self.assertNotIn('not', entry)
+        self.assertEqual(self.track_requests(), [])  # the language matched: no subtitle download at all
+        self.assertEqual(len(self.calls('yt-dlp')), 1)
+        # An article never costs a yt-dlp request and its card gains no language field.
+        page = {'title': 'Yazı', 'language': 'tr', 'content': 'Uzun makale metni. ' * 20}
+        entry, meta, _raw = self.isle({'video': dubbed(), 'defuddle': {'': page}}, url='https://ornek.com/yazi')
+        self.assertEqual(entry['yontem'], 'defuddle')
+        self.assertEqual(self.calls('yt-dlp'), [])
+        self.assertNotIn('--lang', self.calls('npx')[0])
+        self.assertFalse({'dil', 'altyazi', 'uyari'} & set(meta))
+
+    def test_wrong_defuddle_language_gives_way_to_the_spoken_track(self):
+        # Defuddle keeps answering with the Arabic dub even when asked for en-US.
+        entry, meta, raw = self.isle({'video': dubbed(), 'defuddle': {'': defuddle('ar', ARABIC)}, 'speech': {'auto:en-orig': ENGLISH}})
+        self.assertIn(ENGLISH, raw)
+        self.assertNotIn(ARABIC, raw)
+        self.assertEqual((entry['yontem'], entry['dil'], entry['altyazi']), ('yt-dlp-altyazi', 'en', 'en-orig (otomatik)'))
+        self.assertIn('![](' + VIDEO + ')\n\n## Transcript\n\n**0:01** So, I gave', raw)
+        self.assertEqual((meta['dil'], meta['altyazi']), ('en', 'en-orig (otomatik)'))
+        self.assertNotIn('uyari', meta)
+        self.assertEqual(self.track_requests(), [('en-orig', True)])
+        self.assertIn('--lang', self.calls('npx')[0])
+
+    def test_dubbed_video_without_defuddle_requests_one_track_not_every_orig(self):
+        entry, meta, raw = self.isle({'video': dubbed(), 'speech': {'auto:en-orig': ENGLISH}}, npx=False)
+        self.assertEqual((entry['durum'], entry.get('yontem')), ('cikarildi', 'yt-dlp-altyazi'))
+        self.assertIn(ENGLISH, raw)  # not `ar-orig`, the first `-orig` track in the alphabet
+        self.assertEqual(self.track_requests(), [('en-orig', True)])  # asking for all 21 is what drew HTTP 429
+        self.assertEqual((meta.get('dil'), meta.get('altyazi')), ('en', 'en-orig (otomatik)'))
+
+    def test_http_429_on_the_first_track_request_moves_to_the_next_track(self):
+        scenario = {'video': video('tr', audio=[('tr', -1)], manual=['tr'], recognised=['tr-orig', 'tr'], translated=['en']),
+                    'speech': {'auto:tr-orig': TURKISH}, 'fail_first': 1}
+        entry, meta, raw = self.isle(scenario, npx=False)
+        self.assertEqual((entry['durum'], entry.get('altyazi')), ('cikarildi', 'tr-orig (otomatik)'))
+        self.assertIn(TURKISH, raw)
+        self.assertEqual(self.track_requests(), [('tr', False), ('tr-orig', True)])
+        self.assertEqual(meta['dil'], 'tr')
+        self.assertNotIn('uyari', meta)
+
+    def test_wrong_language_is_kept_only_with_a_warning(self):
+        # Every track request is refused: the dub transcript is all there is.
+        scenario = {'video': dubbed(), 'defuddle': {'': defuddle('ar', ARABIC)}, 'fail_first': 9}
+        entry, meta, raw = self.isle(scenario, whisper=True)
+        self.assertEqual((entry['durum'], entry['yontem'], meta.get('dil')), ('cikarildi', 'defuddle', 'ar'))
+        self.assertIn(ARABIC, raw)
+        for part in ('konusma dilinde olmayabilir', 'video en-US', 'transkript ar'):
+            self.assertIn(part, meta.get('uyari', ''))
+        self.assertEqual(entry['not'], meta['uyari'])
+        self.assertEqual(self.track_requests(), [('en-orig', True)])
+        # Audio stays the last resort for a video with no transcript at all; nothing was downloaded here.
+        self.assertEqual([call for call in self.calls('yt-dlp') if '-f' in call], [])
+        # A later run that gets the track replaces the warning it wrote.
+        entry, meta, raw = self.isle(dict(scenario, fail_first=0, speech={'auto:en-orig': ENGLISH}))
+        self.assertEqual((meta['dil'], meta['altyazi']), ('en', 'en-orig (otomatik)'))
+        self.assertNotIn('uyari', meta)
+        self.assertNotIn(ARABIC, raw)
+
+    def test_no_metadata_language_is_marked_unverified(self):
+        # Like jNQXAC9IVRw: manual tracks only, no speech recognition, so yt-dlp names no language.
+        scenario = {'video': video(None, audio=[(None, -1)], manual=['de', 'en']), 'defuddle': {'': defuddle('en', ENGLISH)},
+                    'speech': {'manual:en': ENGLISH}}
+        entry, meta, raw = self.isle(scenario)
+        self.assertEqual((entry['yontem'], meta.get('dil')), ('defuddle', 'en'))
+        self.assertIn('Konusma dili dogrulanamadi', meta.get('uyari', ''))
+        self.assertIn('transkript dili: en', meta['uyari'])
+        self.assertEqual(entry['not'], meta['uyari'])
+        self.assertNotIn('--lang', self.calls('npx')[0])
+        self.assertEqual(self.track_requests(), [])
+        # Without Defuddle a track is still taken, and the card names it.
+        entry, meta, raw = self.isle(scenario, npx=False)
+        self.assertEqual((entry['yontem'], meta['dil'], meta['altyazi']), ('yt-dlp-altyazi', 'en', 'en (elle)'))
+        self.assertIn('kullanilan altyazi izi: en (elle)', meta['uyari'])
+        self.assertEqual(self.track_requests(), [('en', False)])
+
+    def test_refused_metadata_request_leaves_defuddle_unverified(self):
+        entry, meta, raw = self.isle({'video': None, 'defuddle': {'': defuddle('ar', ARABIC)}})
+        self.assertEqual((entry['yontem'], meta.get('dil')), ('defuddle', 'ar'))
+        self.assertIn('yt-dlp video bilgisini alamadi', meta.get('uyari', ''))
+        self.assertEqual(self.track_requests(), [])  # no blind request for tracks it could not list
+        self.assertEqual(len(self.calls('yt-dlp')), 1)
+
+    def test_turkish_video_manual_track_beats_automatic(self):
+        tracks = {'recognised': ['tr-orig', 'tr'], 'translated': ['en', 'ar']}
+        scenario = {'video': video('tr', audio=[('tr', -1)], manual=['en', 'tr'], **tracks),
+                    'speech': {'manual:tr': TURKISH, 'auto:tr-orig': 'otomatik ' * 20}}
+        entry, meta, raw = self.isle(scenario, npx=False)
+        self.assertIn(TURKISH, raw)  # the manual track, with Ş, ğ, ü, ç, ö, İ and ı intact
+        self.assertEqual((meta.get('dil'), meta.get('altyazi')), ('tr', 'tr (elle)'))
+        self.assertEqual(self.track_requests(), [('tr', False)])
+        # No manual Turkish track: the recognised one, never the English translation or the manual `en`.
+        scenario = {'video': video('tr', audio=[('tr', -1)], manual=['en'], **tracks), 'speech': {'auto:tr-orig': TURKISH}}
+        entry, meta, raw = self.isle(scenario, npx=False)
+        self.assertEqual((meta['dil'], meta['altyazi']), ('tr', 'tr-orig (otomatik)'))
+        self.assertIn(TURKISH, raw)
+        self.assertNotIn('uyari', meta)
+        # With Defuddle the Turkish transcript is verified and no track is downloaded.
+        entry, meta, raw = self.isle(dict(scenario, defuddle={'tr': defuddle('tr', TURKISH)}))
+        self.assertEqual((entry['yontem'], meta['dil'], meta.get('altyazi'), meta.get('uyari')), ('defuddle', 'tr', None, None))
+        self.assertEqual(self.track_requests(), [])
+
+    def test_without_ytdlp_defuddle_stands_and_is_marked_unverified(self):
+        entry, meta, raw = self.isle({'defuddle': {'': defuddle('ar', ARABIC)}}, yt_dlp=False)
+        self.assertEqual((entry['durum'], entry['yontem']), ('cikarildi', 'defuddle'))
+        self.assertIn(ARABIC, raw)  # as before: there is nothing to check it against
+        self.assertEqual(meta.get('dil'), 'ar')
+        self.assertIn('yt-dlp kurulu degil', meta.get('uyari', ''))
+        self.assertEqual(self.calls('yt-dlp'), [])
+        self.assertNotIn('--lang', self.calls('npx')[0])
+        # No transcript and no yt-dlp: the old note, no language claim.
+        entry, meta, raw = self.isle({'defuddle': {'': defuddle('en')}}, yt_dlp=False)
+        self.assertIn('Altyazi bulunamadi', entry['not'])
+        self.assertFalse({'dil', 'altyazi', 'uyari'} & set(meta))
+
+    def test_spoken_language_and_track_order_from_metadata(self):
+        def tracks(data):
+            with tempfile.TemporaryDirectory() as work, patch.object(yakala, '_run', return_value=(0, json.dumps(data), '')):
+                return yakala.youtube_tracks(VIDEO, {'yt_dlp': 'yt-dlp'}, work)
+        self.assertEqual(tracks(dubbed()), {'dil': 'en-US', 'adaylar': [('en-orig', True)]})
+        # Region codes: the exact track, then the bare language, then another region; a manual one first.
+        german = video('de-DE', audio=[('de-DE', -1)], manual=['de', 'en'], recognised=['de-DE-orig', 'de-DE', 'de-orig'], translated=['de'])
+        self.assertEqual(tracks(german), {'dil': 'de-DE', 'adaylar': [('de', False), ('de-DE-orig', True), ('de-orig', True)]})
+        # No `language`, one recognised track: that is what is spoken.
+        self.assertEqual(tracks(video(None, recognised=['ja-orig', 'ja'], translated=['en', 'tr'])),
+                         {'dil': 'ja', 'adaylar': [('ja-orig', True), ('ja', True)]})
+        # Several audio languages and none marked original: nothing to go on, Turkish and English first.
+        unmarked = video('tr', audio=[('tr', 5), ('en', -1), ('en-desc', -10)], recognised=['en-orig', 'tr-orig', 'ar-orig'], translated=['de'])
+        self.assertEqual(tracks(unmarked), {'dil': None, 'adaylar': [('tr-orig', True), ('en-orig', True), ('ar-orig', True)]})
+        # A language that is not a language code is not passed on to a command line.
+        self.assertIsNone(tracks(video('--evil', recognised=['en-orig', 'tr-orig']))['dil'])
+        odd = video('en', manual=['live_chat', 'all', '-en', 'en.*', 'en'], recognised=['en-orig'])
+        self.assertEqual(tracks(odd)['adaylar'], [('en', False), ('en-orig', True)])
+        # A playlist address answers with its videos; the first one stands for it.
+        self.assertEqual(tracks({'_type': 'playlist', 'entries': [dubbed(), german]})['dil'], 'en-US')
+        for unusable in (['not', 'a', 'video'], {'_type': 'playlist', 'entries': []}):
+            self.assertIsNone(tracks(unusable))
+        self.assertIsNone(yakala.youtube_tracks(VIDEO, {'yt_dlp': None}, self.tmp.name))
+
+
 class YakalaInstalledTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-')
@@ -231,6 +519,31 @@ class YakalaInstalledTest(unittest.TestCase):
         self.assertEqual(added['kaynak_turu'], 'x')
         listed = self.entry('liste')
         self.assertEqual(listed['bekleyen'], 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'the stand-in tools are shell wrappers on PATH')
+    def test_isle_stores_the_spoken_language_of_a_dubbed_video(self):
+        tools = Path(self.tmp.name) / 'bin'
+        tools.mkdir()
+        (tools / 'fake_tool.py').write_text(FAKE_TOOL, encoding='utf-8')
+        scenario = {'video': dubbed(), 'defuddle': {'': defuddle('ar', ARABIC)}, 'speech': {'auto:en-orig': ENGLISH}}
+        (tools / 'scenario.json').write_text(json.dumps(scenario), encoding='utf-8')
+        for name in ('npx', 'yt-dlp'):
+            (tools / name).write_text('#!/bin/sh\nexec ' + shlex.join([sys.executable, str(tools / 'fake_tool.py'), name])
+                                      + ' "$@"\n', encoding='utf-8')
+            (tools / name).chmod(0o755)
+        self.env['PATH'] = isolated_path(tools)
+        added = self.entry('ekle', VIDEO, '--neden', 'dublaj')
+        entry = self.entry('isle', '--ses-yok')['kartlar'][0]
+        self.assertEqual((entry['durum'], entry.get('yontem'), entry.get('dil')), ('cikarildi', 'yt-dlp-altyazi', 'en'))
+        meta = yakala.find_card(self.vault, added['id'])['meta']
+        self.assertEqual((meta.get('dil'), meta.get('altyazi'), meta.get('uyari')), ('en', 'en-orig (otomatik)', None))
+        raw = (self.vault / entry['ham']).read_text(encoding='utf-8')
+        self.assertIn(ENGLISH, raw)
+        self.assertNotIn(ARABIC, raw)
+        calls = [json.loads(line) for line in (tools / 'calls.jsonl').read_text(encoding='utf-8').splitlines()]
+        asked = [call[call.index('--sub-langs') + 1] for call in calls if '--sub-langs' in call]
+        self.assertEqual(asked, ['en-orig'])
+        self.assertEqual([call[0] for call in calls], ['yt-dlp', 'npx', 'yt-dlp'])
 
     def test_session_notice_is_opt_in(self):
         self.entry('ekle', 'https://ornek.com/yazi')

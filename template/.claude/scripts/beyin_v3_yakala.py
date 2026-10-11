@@ -280,17 +280,21 @@ def tools():
             'pdftotext': _which('pdftotext'), 'ffmpeg': _which('ffmpeg')}
 
 
-def via_defuddle(url, found, info=None):
-    """Main text as Markdown; title, author and date go into `info` when given."""
+def via_defuddle(url, found, info=None, lang=None):
+    """Main text as Markdown; title, author, date and language go into `info` when given.
+
+    `lang` asks for a video transcript in that language; `language` in the answer is the track it took.
+    """
     if not found['npx']:
         return None
     try:
-        code, out, _ = _run([found['npx'], '-y', DEFUDDLE, 'parse', url, '--json', '--markdown'], timeout=180)
+        code, out, _ = _run([found['npx'], '-y', DEFUDDLE, 'parse', url, '--json', '--markdown']
+                            + (['--lang', lang] if lang else []), timeout=180)
         data = json.loads(out) if code == 0 else {}
     except (OSError, subprocess.TimeoutExpired, ValueError):
         return None
     if info is not None:
-        info.update({key: str(data[key]).strip() for key in ('title', 'author', 'published', 'site')
+        info.update({key: str(data[key]).strip() for key in ('title', 'author', 'published', 'site', 'language')
                      if data.get(key) and str(data[key]).strip()})
     text = str(data.get('content') or '').strip()
     return text if len(text) > 80 else None
@@ -321,25 +325,87 @@ def vtt_text(raw):
     return '\n\n'.join(' '.join(words) for words in paragraphs).strip()
 
 
-def via_subtitles(url, found, workdir):
+YT_INFO = 'video.info.json'
+LANGUAGE = re.compile(r'[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*')
+TRACK = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*')  # also a literal for --sub-langs, which reads a regex
+
+
+def _base(code):
+    """`en` for `en-US`, `en-orig` and `EN_us`."""
+    return re.split(r'[-_]', str(code or '').strip().lower())[0]
+
+
+def _spoken(data, recognised):
+    """The language spoken in the video as yt-dlp metadata tells it; None when it does not."""
+    audio = {}
+    for fmt in data.get('formats') or []:
+        if isinstance(fmt, dict) and fmt.get('language'):
+            audio.setdefault(str(fmt['language']), set()).add(fmt.get('language_preference'))
+    original = [code for code, marks in audio.items() if 10 in marks]  # yt-dlp: 10 is the original audio track
+    if len(original) == 1:
+        spoken = original[0]
+    elif len({_base(code) for code in audio}) > 1:
+        return None  # several audio languages and none marked original: any pick would be a guess
+    else:
+        spoken = data.get('language') or (recognised[0][:-5] if len(recognised) == 1 else None)
+    return str(spoken) if spoken and LANGUAGE.fullmatch(str(spoken)) else None
+
+
+def youtube_tracks(url, found, workdir):
+    """One yt-dlp metadata request: {'dil': spoken language or None, 'adaylar': [(track, automatic), ...]}.
+
+    `-orig` is the speech recognition of one audio track. An auto-dubbed video has one per dub, and
+    its plain `en`/`tr` tracks are machine translations of a dub, so a track name alone does not say
+    what is spoken (#277). Candidates are the tracks in the spoken language, a manual one first; when
+    the language is unknown they are a best effort the caller marks as unverified.
+    Returns None without yt-dlp or without an answer.
+    """
     if not found['yt_dlp']:
         return None
-    command = [found['yt_dlp'], '--skip-download', '--write-subs', '--write-auto-subs',
-               '--sub-langs', '.*-orig,tr,en', '--sub-format', 'vtt', '--no-playlist',
-               '-o', str(Path(workdir) / 'sub.%(ext)s'), url]
     try:
-        _run(command, timeout=180)
+        _, out, _ = _run([found['yt_dlp'], '--skip-download', '--no-playlist', '-J', url], timeout=180)
+        data = json.loads(out)
+        if isinstance(data, dict) and isinstance(data.get('entries'), list):  # a playlist address: its first video
+            data = data['entries'][0] if data['entries'] else None
+            out = json.dumps(data)
+        if not isinstance(data, dict):
+            return None
+        (Path(workdir) / YT_INFO).write_text(out, encoding='utf-8')  # the track requests reuse it
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    manual = data.get('subtitles') if isinstance(data.get('subtitles'), dict) else {}
+    auto = data.get('automatic_captions') if isinstance(data.get('automatic_captions'), dict) else {}
+
+    def heard(key):  # speech recognition itself, not its machine translation (`tlang`) into another language
+        formats = [fmt for fmt in auto[key] or [] if isinstance(fmt, dict) and fmt.get('ext') == 'vtt']
+        return key.endswith('-orig') or bool(formats) and 'tlang=' not in str(formats[-1].get('url'))
+    manual = [key for key in manual if TRACK.fullmatch(key) and key not in ('live_chat', 'all')]
+    auto = [key for key in auto if TRACK.fullmatch(key) and heard(key)]
+    recognised = [key for key in auto if key.endswith('-orig')]
+    spoken = _spoken(data, recognised)
+
+    def order(key):
+        if not spoken:
+            return {'tr': 0, 'en': 1}.get(_base(key), 2), key
+        code = key.lower().removesuffix('-orig')  # the exact code, then the bare language, then its other regions
+        return 0 if code == spoken.lower() else 1 if code == _base(spoken) else 2, key
+    tracks = []
+    for keys, automatic in ((manual, False), (recognised, True), ([key for key in auto if key not in recognised], True)):
+        tracks += [(key, automatic) for key in sorted(keys, key=order) if not spoken or _base(key) == _base(spoken)]
+    return {'dil': spoken, 'adaylar': tracks[:3]}
+
+
+def via_subtitles(found, workdir, track, automatic):
+    """One track per request: asking for every `-orig` track at once is what YouTube answers with HTTP 429."""
+    command = [found['yt_dlp'], '--load-info-json', str(Path(workdir) / YT_INFO), '--skip-download',
+               '--write-auto-subs' if automatic else '--write-subs', '--sub-langs', track, '--sub-format', 'vtt',
+               '-o', str(Path(workdir) / 'sub.%(ext)s')]
+    try:
+        _run(command, timeout=120)
+        text = vtt_text((Path(workdir) / ('sub.' + track + '.vtt')).read_text(encoding='utf-8', errors='replace'))
     except (OSError, subprocess.TimeoutExpired):
         return None
-    def rank(path):  # original-language track first, then a human Turkish/English one
-        name = path.name
-        return (0 if name.endswith('-orig.vtt') else 1 if name.endswith('.tr.vtt') else 2 if name.endswith('.en.vtt') else 3, name)
-    subs = sorted(Path(workdir).glob('sub*.vtt'), key=rank)
-    for path in subs:
-        text = vtt_text(path.read_text(encoding='utf-8', errors='replace'))
-        if len(text) > 80:
-            return text
-    return None
+    return text if len(text) > 80 else None
 
 
 def via_audio(url, found, workdir):
@@ -367,6 +433,54 @@ def via_audio(url, found, workdir):
         for path in Path(workdir).glob('ses.*'):
             if path.suffix != '.txt':
                 path.unlink(missing_ok=True)
+
+
+def via_youtube(url, found, allow_audio=True, info=None):
+    """(text, method, note) for a video, the transcript in the spoken language where that can be told.
+
+    yt-dlp names the spoken language, Defuddle is asked for that language and its answer is checked.
+    A transcript in another language (a dub, a translation) gives way to the yt-dlp track; when that
+    cannot be had it is kept with a warning. Audio stays the last resort for a video with no transcript,
+    and without yt-dlp Defuddle's own pick stands as before. `info` gains `dil` (language of the stored
+    transcript), `altyazi` (yt-dlp track) and `uyari` (set when that language is unverified).
+    """
+    info = {} if info is None else info
+    info.update(dil=None, altyazi=None, uyari=None)
+    with tempfile.TemporaryDirectory(prefix='beyin-yakala-') as workdir:
+        tracks = youtube_tracks(url, found, workdir)
+        spoken = tracks['dil'] if tracks else None
+        why = 'yt-dlp kurulu degil' if not found['yt_dlp'] else 'yt-dlp video bilgisini alamadi' if not tracks \
+            else 'video bilgisinde konusma dili yok'
+        text = via_defuddle(url, found, info, spoken)
+        section = re.search(r'^## Transcript', text or '', re.M)
+        took = info.get('language', '')[:20] if section else None
+        if section and (not spoken or _base(took) == _base(spoken)):
+            info['dil'] = took
+            if not spoken:
+                info['uyari'] = 'Konusma dili dogrulanamadi (' + why + '); transkript dili: ' + (took or 'bilinmiyor') + '.'
+            return text, 'defuddle', info['uyari']
+        lead = (text[:section.start()].rstrip() if section else text) or ''
+        lead += '\n\n## Transcript\n\n' if lead else ''
+        for track, automatic in (tracks['adaylar'] if tracks else ()):
+            subtitles = via_subtitles(found, workdir, track, automatic)
+            if subtitles:
+                info.update(dil=track.removesuffix('-orig'), altyazi=track + (' (otomatik)' if automatic else ' (elle)'))
+                if not spoken:
+                    info['uyari'] = 'Konusma dili dogrulanamadi (' + why + '); kullanilan altyazi izi: ' + info['altyazi'] + '.'
+                return lead + subtitles, 'yt-dlp-altyazi', info['uyari']
+        if allow_audio and not section:
+            words = via_audio(url, found, workdir)
+            if words:
+                info['dil'] = spoken
+                return lead + words, 'ses-whisper', None
+    if section:  # only a transcript in another language could be had: keep it and say so on the card
+        info['dil'] = took
+        info['uyari'] = ('Transkript konusma dilinde olmayabilir: video ' + spoken + ', transkript ' + (took or 'bilinmiyor') +
+                         ' (dublaj ya da ceviri izi). Konusma dilindeki altyazi alinamadi; sonra `yakala isle <kart>` ile yeniden dene.')
+        return text, 'defuddle', info['uyari']
+    if text:
+        return text, 'defuddle', 'Altyazi bulunamadi; yalniz baslik ve aciklama var. Ses yolu icin yt-dlp ve whisper gerekir.'
+    return None, None, 'YouTube icerigi alinamadi: npx (Node), yt-dlp ya da whisper bulunamadi veya video erisilemez.'
 
 
 def via_stdlib(url):
@@ -432,20 +546,7 @@ def extract(vault, card, found, allow_audio=True, info=None):
     if clipped and len(clipped) > 200 and kind != 'youtube':
         return clipped, 'web-clipper', None
     if kind == 'youtube' and url:
-        text = via_defuddle(url, found, info)
-        if text and re.search(r'^## Transcript', text, re.M):
-            return text, 'defuddle', None
-        with tempfile.TemporaryDirectory(prefix='beyin-yakala-') as workdir:
-            subtitles = via_subtitles(url, found, workdir)
-            if subtitles:
-                return ((text + '\n\n## Transcript\n\n') if text else '') + subtitles, 'yt-dlp-altyazi', None
-            if allow_audio:
-                spoken = via_audio(url, found, workdir)
-                if spoken:
-                    return ((text + '\n\n## Transcript\n\n') if text else '') + spoken, 'ses-whisper', None
-        if text:
-            return text, 'defuddle', 'Altyazi bulunamadi; yalniz baslik ve aciklama var. Ses yolu icin yt-dlp ve whisper gerekir.'
-        return None, None, 'YouTube icerigi alinamadi: npx (Node), yt-dlp ya da whisper bulunamadi veya video erisilemez.'
+        return via_youtube(url, found, allow_audio, info)
     if kind == 'mail':
         selected = _section(body, 'Secim')
         if selected:
@@ -515,7 +616,13 @@ def process(vault, card_ids=None, allow_audio=True, retry=False):
                                         'Tam metin ham dosyaya tasindi: `' + raw.relative_to(vault).as_posix() + '`')
             meta.update(durum='cikarildi', yontem=method, ham=raw.relative_to(vault).as_posix())
             meta.pop('hata', None)
+            for key in ('dil', 'altyazi', 'uyari'):  # only the video path reports these; a rerun replaces its own
+                if key in info:
+                    meta.pop(key, None)
+                    if info[key]:
+                        meta[key] = info[key]
             entry.update(durum='cikarildi', yontem=method, ham=meta['ham'], karakter=len(text))
+            entry.update({key: info[key] for key in ('dil', 'altyazi') if info.get(key)})
         elif method == 'ajan-okusun':
             meta.update(durum='cikarildi', yontem=method)
             entry.update(durum='cikarildi', yontem=method)
@@ -1209,6 +1316,9 @@ Windows'ta komutlardaki `python3` yerine `py -3` yaz.
 - `hata` kartında karttaki `hata` notunu oku ve kullanıcıya ne gerektiğini söyle (sayfa giriş
   istiyorsa Web Clipper ile sayfa açıkken yakalamak, video için `yt-dlp`). Yeniden denemek için
   `python3 beyin.py yakala isle --tekrar`.
+- Video kartında `dil` kaydedilen transkriptin dilidir. `uyari` varsa (konuşma dili doğrulanamadı
+  ya da transkript dublaj/çeviri dilinde) kullanıcıya söyle; `yt-dlp` kuruluysa
+  `python3 beyin.py yakala isle <id>` ile yeniden dene.
 - `visibility: private` kartlardan (mail, pano metni, dosya) çıkan derslerde kişi adı, adres,
   numara gibi kişisel veriyi bilgi notuna taşıma.
 - Kartları ve `.ham/` dosyalarını silme; kullanıcının arşividir.
