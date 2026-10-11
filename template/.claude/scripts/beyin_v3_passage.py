@@ -340,6 +340,8 @@ def search(index, terms, limit=5, floor=FLOOR, min_shared=MIN_SHARED):
     """Best admitted passage per source, ranked. Returns [(rank weight, passage), ...]."""
     if not terms:
         return []
+    # For a one-word query two shared terms are impossible; keep the calibrated weight floor.
+    min_shared = min(min_shared, len(terms))
     passages_total = max(1, len(index.passages))
     sources_total = max(1, index.sources)
     wanted = min(len(terms), COVERAGE_CAP)
