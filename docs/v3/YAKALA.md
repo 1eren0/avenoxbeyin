@@ -167,7 +167,7 @@ python3 beyin.py yakala kur --klasor "Notlar/Yakala"
 | Kaynak | Yol |
 |---|---|
 | Web Clipper ile gelen sayfa | Yakalanan metin kullanılır, ağa çıkılmaz |
-| YouTube | [Defuddle](https://github.com/kepano/defuddle) ile bölümlü transkript; olmazsa `yt-dlp` altyazısı; o da yoksa yalnız ses indirilir, yerel Whisper ile yazıya dökülür, ses silinir |
+| YouTube | [Defuddle](https://github.com/kepano/defuddle) ile bölümlü transkript; olmazsa ya da dili konuşma diliyle uyuşmazsa `yt-dlp` altyazısı; o da yoksa yalnız ses indirilir, yerel Whisper ile yazıya dökülür, ses silinir |
 | X, Reddit, GitHub, makale | Defuddle; yoksa düz HTTP ile metin |
 | Mail | Seçili metin; tamamı için ajanın Gmail/Outlook bağlantısı |
 | PDF, metin dosyası | `pdftotext` ya da doğrudan okuma; görselleri ajan açar |
@@ -176,13 +176,30 @@ Ham metin kart klasörünün içinde `.ham/` altında durur. Nokta ile başlayan
 aramaya ve Obsidian'a karışmaz. `.ham/` ve yakalanan dosyaların durduğu `dosyalar/`, içlerine yazılan
 `.gitignore` ile kart klasörü hangisi olursa olsun depoya da girmez.
 
+### Videoda transkriptin dili
+
+Otomatik dublajlı bir videoda YouTube her dublaj için ayrı bir altyazı izi sunar. `isle`,
+`yt-dlp` kuruluysa videoda konuşulan dili videonun bilgisinden öğrenir, Defuddle'dan o dildeki
+transkripti ister ve gelen dili kontrol eder. Uyuşmazsa `yt-dlp` ile yalnız konuşma dilindeki
+izi indirir; elle yazılmış altyazı otomatik olandan önce gelir. Sonuç kartın frontmatter'ına yazılır:
+
+- `dil`: kaydedilen transkriptin dili.
+- `altyazi`: `yt-dlp` ile alınan iz, örneğin `en-orig (otomatik)` ya da `tr (elle)`.
+- `uyari`: yalnız bir sorun belirtisi varsa yazılır: transkript konuşma dilinde alınamadıysa ya da
+  video dublajlıyken (birden çok dilde ses ya da `-orig` izi) konuşulan dil belirlenemediyse.
+
+`yt-dlp` kurulu değilse dil doğrulanamaz: Defuddle'ın seçtiği transkript eskisi gibi kaydedilir ve
+dili `dil` alanına yazılır. `dil` videoda konuşulan dil değilse `yt-dlp` kurup
+`python3 beyin.py yakala isle <id>` ile yeniden dene; `uyari` olan kart da aynı komutla yeniden
+denenir. Daha önce işlenmiş kartlar değişmez.
+
 ### İsteğe bağlı araçlar
 
 Hiçbiri zorunlu değil; varsa işleme genişler, yoksa elde olanla devam edilir.
 `python3 beyin.py yakala durum` hangilerinin bulunduğunu söyler.
 
 - **Node.js** (`npx`): Defuddle için. Sabit sürüm (`defuddle@0.19.4`) çalıştırılır.
-- **yt-dlp**: video altyazısı ve ses.
+- **yt-dlp**: videoda konuşulan dil, altyazı ve ses.
 - **Whisper**: Mac'te `mlx_whisper`, diğerlerinde `whisper` ya da `whisper-ctranslate2`. Ses indirmeyi istemezsen `isle --ses-yok`.
 - **pdftotext** (Poppler): PDF metni.
 
