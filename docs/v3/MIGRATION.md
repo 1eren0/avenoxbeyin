@@ -14,9 +14,36 @@ user sources and the original V2 state; the updater owns system-file rollback.
 
 The guard takes nonblocking locks on existing V2 `.claude/scripts/.state/*.lock`
 files and rejects known `inflight`, `running` or `pending` writer states. If a
-worker is active, let it finish and rerun. An orphaned inflight sentinel needs
-explicit reconciliation; the migration never deletes it or declares it safe
-from its age alone. Source or legacy-state changes during cutover reject success.
+worker is active (`legacy writer lock is active`), let it finish and rerun.
+
+One such state is treated as proven dead. Every V2 release that writes
+`status: inflight` to `flush-<key>.json` takes `flush-<key>.lock` first and holds
+it until its terminal status, so on this machine a sentinel whose own lock the
+guard holds was left by a writer that died, for example a logout or shutdown in
+the middle of a summary. That lock says nothing about a flush still running on
+another machine that syncs the vault, and may say nothing across lock interfaces
+(a flush under WSL next to a Windows Python), so the sentinel's own start time
+(`ts`) must also be at least 60 minutes old; a stock flush is done about ten
+minutes after it. Such a sentinel does not block: the file is preserved as it is
+and its path is listed as `orphaned_legacy_state` in the installer result and, at
+the first cutover, in `v2-migration.json`. The summary it was writing most likely
+never reached `daily/`. The same holds on every later `update` for a flush kept
+with `--keep-customized-legacy`; the `update` result lists, and its message
+counts, the sentinels that the cutover receipt does not already name.
+
+Everything else still blocks:
+
+- A flush sentinel whose lock is free but whose `ts` is missing or less than 60
+  minutes old: rerun once it is older, or reconcile it.
+- A flush sentinel without a `flush-<key>.lock` of the same name, a `pending` or
+  `running` state, or a record of another writer (`compile-state.json`,
+  `antigravity-<key>.json`): a free lock proves nothing about these, and the
+  migration never deletes one or declares it safe from its age alone. Reconcile it.
+
+To reconcile, make sure no V2 writer is running on any machine that uses the
+vault, set that record's status to a terminal value such as `fail`, and rerun;
+the session it belonged to may have no summary in `daily/`. Source or
+legacy-state changes during cutover reject success.
 These are local cooperating-worker protections, not a distributed filesystem lock.
 
 The installer also replaces hash-recognized stock legacy runners with reversible
@@ -183,7 +210,8 @@ covers a session.
 ## Validation boundary
 
 Synthetic tests cover byte preservation, idempotent watermarking, inflight
-rejection, concurrent source-edit detection, private Companion filtering,
+rejection, lock-proven orphaned sentinels (one test drives the stock V2 flush
+itself on POSIX), concurrent source-edit detection, private Companion filtering,
 new-only outcome projections, manual-view conflicts, note-create refusal to
 overwrite, and receipt-gap closure. Actual V2 workers, external schedules and
 client trust still require environment-specific validation. A green migration

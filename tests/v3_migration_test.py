@@ -1,12 +1,25 @@
 """Synthetic migration/continuity acceptance tests, fixed before implementation."""
+from datetime import datetime, timedelta
 import importlib
 import json
+import os
 from pathlib import Path
+import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
+from v3_package_helpers import ROOT, inherited_env
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'template/.claude/scripts'))
+
+
+def flush_record(status='inflight', age=7200, **extra):
+    """A sentinel shaped like the one stock V2 flush writes; age is seconds since its recorded start."""
+    return json.dumps(dict({'session_id': 'example', 'ts': int(time.time()) - age, 'status': status}, **extra))
 
 
 class MigrationTest(unittest.TestCase):
@@ -41,6 +54,158 @@ class MigrationTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r'flush-example\.json.*reconcile'):
             self.m.migrate_v2(self.root, self.state)
         self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def test_orphaned_inflight_is_recorded_when_its_writer_lock_is_free(self):
+        # V2 flush holds flush-<key>.lock from before it writes "inflight" until its terminal
+        # state. A guard that holds that lock has proof the writer died mid-summary.
+        record = flush_record()
+        sentinel = self.source('.claude/scripts/.state/flush-example.json', record)
+        self.source('.claude/scripts/.state/flush-example.lock', '')
+        result = self.m.migrate_v2(self.root, self.state)
+        self.assertEqual(result['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
+        self.assertEqual(sentinel.read_bytes(), record.encode('utf-8'))
+        self.assertTrue((self.state / 'v2-preserved-state/.claude/scripts/.state/flush-example.json').exists())
+
+    def test_free_lock_does_not_prove_a_recent_or_undated_sentinel(self):
+        # The state directory travels with a synced vault and a lock does not: a flush that is
+        # still running on another machine leaves this same picture, a fresh sentinel beside a
+        # lock that is free here. Only a start time an hour old rules that out.
+        recent = self.m.ORPHANED_FLUSH_SECONDS - 120
+        for label, record in (('just started', flush_record(age=0)),
+                              ('under the hour', flush_record(age=recent)),
+                              ('clock ahead', flush_record(age=-86400)),
+                              ('no ts', '{"session_id":"example","status":"inflight"}'),
+                              ('null ts', '{"session_id":"example","ts":null,"status":"inflight"}'),
+                              ('text ts', '{"session_id":"example","ts":"1789936860","status":"inflight"}'),
+                              ('boolean ts', '{"session_id":"example","ts":true,"status":"inflight"}'),
+                              ('negative ts', '{"session_id":"example","ts":-1,"status":"inflight"}'),
+                              ('not a number', '{"session_id":"example","ts":NaN,"status":"inflight"}')):
+            with self.subTest(label=label):
+                sentinel = self.source('.claude/scripts/.state/flush-example.json', record)
+                self.source('.claude/scripts/.state/flush-example.lock', '')
+                with self.assertRaisesRegex(RuntimeError, r'flush-example\.json; its lock is free here.*60 minutes old.*'
+                                                          r'Rerun once it is older.*terminal value such as "fail"'):
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+                self.assertEqual(sentinel.read_bytes(), record.encode('utf-8'))
+
+    def test_sentinel_at_the_hour_is_old_enough(self):
+        self.source('.claude/scripts/.state/flush-example.json', flush_record(age=self.m.ORPHANED_FLUSH_SECONDS))
+        self.source('.claude/scripts/.state/flush-example.lock', '')
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
+
+    @unittest.skipUnless(os.name == 'posix', 'drives stock V2 flush with a shell-script model and a process-group kill')
+    def test_stock_v2_flush_holds_its_lock_for_as_long_as_it_says_inflight(self):
+        # The claim the orphan rule rests on, checked against the V2 writer as shipped: while the
+        # real flush is mid-summary its sentinel says "inflight" and its lock cannot be taken;
+        # once that process is killed the same sentinel stays behind and the lock is free.
+        scripts = self.root / '.claude/scripts'
+        legacy = scripts / '.state'
+        legacy.mkdir(parents=True)
+        for name in ('flush.py', '_portalock.py'):
+            shutil.copyfile(ROOT / 'template/.claude/scripts' / name, scripts / name)
+        tools = Path(self.temp.name) / 'bin'
+        tools.mkdir()
+        model = tools / 'claude'
+        model.write_bytes(b'#!/bin/sh\ncat >/dev/null\nsleep 300\n')
+        model.chmod(0o755)
+        transcript = Path(self.temp.name) / 'transcript.jsonl'
+        transcript.write_bytes((json.dumps({'type': 'user', 'message': {'role': 'user', 'content': 'Synthetic question.'}}) + '\n' +
+                                json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'content': 'Synthetic answer.'}}) + '\n').encode('utf-8'))
+        hook_input = legacy / 'hookin-1.json'
+        hook_input.write_bytes(json.dumps({'session_id': 'synthetic-session', 'transcript_path': str(transcript)}).encode('utf-8'))
+        # flush records the event time it is given; a writer that died two hours ago is the case.
+        started = (datetime.now().astimezone() - timedelta(hours=2)).isoformat()
+        env = inherited_env(PATH=str(tools) + os.pathsep + os.environ.get('PATH', os.defpath), HOME=self.temp.name,
+                            TMPDIR=self.temp.name, PYTHONDONTWRITEBYTECODE='1', BEYIN_FAKE_NOW=started)
+        env.pop('BEYIN_INVOKED_BY', None)
+        env.pop('BEYIN_MODEL_RUNNER', None)
+        writer = subprocess.Popen([sys.executable, str(scripts / 'flush.py'), '--hook-input', str(hook_input)],
+                                  cwd=self.root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def stop():
+            try:
+                os.killpg(writer.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            writer.wait(timeout=60)
+        self.addCleanup(stop)
+        sentinels = []
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and writer.poll() is None:
+            sentinels = [path for path in legacy.glob('flush-*.json') if b'"inflight"' in path.read_bytes()]
+            if sentinels:
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(sentinels), 1, 'stock flush never reached its model call')
+        sentinel = sentinels[0]
+        self.assertTrue(sentinel.with_suffix('.lock').is_file())
+        with self.assertRaisesRegex(RuntimeError, 'legacy writer lock is active'):
+            with self.m.migration_guard(self.root, self.state):
+                pass
+        stop()
+        left = sentinel.read_bytes()
+        self.assertEqual(json.loads(left)['status'], 'inflight')
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['orphaned_legacy_state'], [sentinel.relative_to(self.root).as_posix()])
+        self.assertEqual(sentinel.read_bytes(), left)
+
+    def test_inflight_with_an_active_writer_lock_still_blocks(self):
+        self.source('.claude/scripts/.state/flush-example.json', flush_record())
+        lock = self.source('.claude/scripts/.state/flush-example.lock', '0')
+        with self.m._legacy_lock(lock):
+            with self.assertRaisesRegex(RuntimeError, 'legacy writer lock'):
+                self.m.migrate_v2(self.root, self.state)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def test_inflight_under_another_writers_lock_still_blocks(self):
+        # Only the sentinel's own lock is proof: compile.lock says nothing about a claim
+        # in compile-state.json.
+        self.source('.claude/scripts/.state/compile-state.json', '{"state":"running"}')
+        self.source('.claude/scripts/.state/compile.lock', '')
+        with self.assertRaisesRegex(RuntimeError, r'compile-state\.json.*reconcile'):
+            self.m.migrate_v2(self.root, self.state)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def test_only_a_flush_inflight_claim_is_proven_by_its_lock(self):
+        # Stock V2 also leaves antigravity-<key>.json next to antigravity-<key>.lock, and it
+        # never writes "pending" or "running" at all: a free lock and an old start time prove
+        # nothing about those.
+        state_dir = self.root / '.claude/scripts/.state'
+        for name, record in (('antigravity-example', flush_record(state='pending', status='ok')),
+                             ('antigravity-example', flush_record()),
+                             ('flush-example', flush_record(status='pending')),
+                             ('flush-example', flush_record(status='running')),
+                             ('flush-example', flush_record(state='pending'))):
+            with self.subTest(name=name, record=record):
+                sentinel = self.source('.claude/scripts/.state/' + name + '.json', record)
+                lock = self.source('.claude/scripts/.state/' + name + '.lock', '')
+                self.addCleanup(sentinel.unlink, missing_ok=True)
+                self.addCleanup(lock.unlink, missing_ok=True)
+                with self.assertRaisesRegex(RuntimeError, name + r'\.json; verify the prior write completed.*reconcile'):
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+                sentinel.unlink()
+                lock.unlink()
+        self.assertEqual(list(state_dir.iterdir()), [])
+
+    def test_blocking_sentinel_error_says_how_to_reconcile(self):
+        # No lock of the same name: nothing is proven, however old the record is.
+        self.source('.claude/scripts/.state/flush-example.json', flush_record())
+        with self.assertRaisesRegex(RuntimeError, r'verify the prior write completed.*no V2 writer running.*terminal value such as "fail"'):
+            self.m.migrate_v2(self.root, self.state)
+
+    def test_orphaned_inflight_left_after_cutover_does_not_block_a_later_guard(self):
+        # update and recover enter the same guard and take no flags, and a kept V2 flush can
+        # die mid-summary long after the cutover.
+        first = self.m.migrate_v2(self.root, self.state)
+        self.source('.claude/scripts/.state/flush-later.json', flush_record())
+        self.source('.claude/scripts/.state/flush-later.lock', '')
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['orphaned_legacy_state'], ['.claude/scripts/.state/flush-later.json'])
+            self.assertEqual(self.m.finalize_migration(self.root, self.state, plan), first)
 
     def test_legacy_lock_is_guarded_but_excluded_from_inventory(self):
         lock = self.source('.claude/scripts/.state/compile.lock', '')

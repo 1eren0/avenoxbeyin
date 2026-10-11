@@ -100,6 +100,72 @@ class OfflineUpdateTest(unittest.TestCase):
         self.assertEqual(core.read_bytes(), original)
         self.assertEqual(self.note.read_text(), 'User edit after system update.\n')
 
+    def orphaned_flush(self, name, age=7200):
+        """The record a stock V2 flush leaves when it dies mid-summary, beside its free lock."""
+        legacy = self.vault / '.claude/scripts/.state'
+        legacy.mkdir(parents=True, exist_ok=True)
+        sentinel = legacy / (name + '.json')
+        sentinel.write_bytes(json.dumps({'session_id': name, 'ts': int(time.time()) - age, 'status': 'inflight'}).encode('utf-8'))
+        (legacy / (name + '.lock')).write_bytes(b'')
+        return sentinel
+
+    def test_update_reports_a_flush_sentinel_orphaned_after_the_cutover(self):
+        # A kept V2 flush that dies mid-summary leaves "inflight" behind. update takes no flags,
+        # so a guard that ignored the proof of its own lock stopped every later update here.
+        sentinel = self.orphaned_flush('flush-example')
+        left = sentinel.read_bytes()
+        report = self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(report['status'], 'updated')
+        self.assertEqual(report['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
+        self.assertEqual(self.version(), '3.0.1')
+        self.assertEqual(sentinel.read_bytes(), left)
+
+    def test_update_waits_for_a_recent_flush_sentinel(self):
+        sentinel = self.orphaned_flush('flush-example', age=30)
+        left = sentinel.read_bytes()
+        before = snapshot(self.vault)
+        with self.assertRaisesRegex(RuntimeError, r'flush-example\.json; its lock is free here.*60 minutes old'):
+            self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(self.version(), '3.0.0')
+        self.assertEqual(sentinel.read_bytes(), left)
+        self.assertEqual(snapshot(self.vault), before)
+        self.assertFalse((self.state / 'update-journal.json').exists())
+
+    def test_update_does_not_repeat_sentinels_the_cutover_receipt_lists(self):
+        # After a cutover that retired flush nothing ever rewrites its dead sentinels: a note
+        # about them on every later update would never stop. Only a later one is news.
+        self.vault = self.base / 'Synthetic Vault Devir'
+        self.vault.mkdir()
+        self.state = self.base / 'runtime-devir'
+        self.orphaned_flush('flush-before')
+        installed = install(self.vault, self.state, self.env)
+        self.assertEqual(installed.returncode, 0, installed.stderr.decode('utf-8', errors='replace'))
+        recorded = ['.claude/scripts/.state/flush-before.json']
+        self.assertEqual(json.loads(installed.stdout)['orphaned_legacy_state'], recorded)
+        receipt = (self.state / 'v2-migration.json').read_bytes()
+        self.assertEqual(json.loads(receipt)['orphaned_legacy_state'], recorded)
+        self.orphaned_flush('flush-later')
+        report = self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(report['status'], 'updated')
+        self.assertEqual(report['orphaned_legacy_state'], ['.claude/scripts/.state/flush-later.json'])
+        self.assertEqual((self.state / 'v2-migration.json').read_bytes(), receipt)
+        self.assertEqual(self.module.rollback(self.vault, self.state)['status'], 'rolled_back')
+        (self.vault / '.claude/scripts/.state/flush-later.json').unlink()
+        again = self.module.update(self.vault, self.state, self.package)
+        self.assertEqual(again['status'], 'updated')
+        self.assertNotIn('orphaned_legacy_state', again)
+
+    def test_update_message_counts_orphaned_flush_sentinels(self):
+        spec = importlib.util.spec_from_file_location('update_test_entry_cli', ROOT / 'scripts/beyin_entry.py')
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        report = {'status': 'updated', 'from_version': '3.0.0', 'version': '3.0.1'}
+        self.assertNotIn('flush', entry.human_result(report, 'update'))
+        message = entry.human_result(dict(report, orphaned_legacy_state=['a.json', 'b.json']), 'update')
+        self.assertIn('Yarida kesilmis 2 V2 flush kaydi var (durumu inflight', message)
+        self.assertIn('daily/ altina yazilmamis olabilir', message)
+        self.assertTrue(message.isascii())
+
     def test_update_lock_does_not_create_empty_sqlite_file(self):
         import sqlite3
         memory_db = self.state / 'memory.sqlite3'

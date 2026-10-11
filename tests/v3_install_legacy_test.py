@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from v3_package_helpers import ROOT, build_package, isolated_env, run_python, snapshot
@@ -17,6 +18,11 @@ SKILLS = ('beyin', 'beyin-doktor', 'beyin-guncelle')
 ROOTS = ('.agents', '.claude')
 CUSTOM_RUNNER = b'# kullanicinin kendi flush surumu\nprint("synthetic customized legacy runner")\n'
 CUSTOM_HOOK = b'#!/bin/sh\n# kullanicinin kendi session-end kancasi\nexit 0\n'
+
+
+def flush_sentinel(age):
+    """The record stock V2 flush leaves when it dies mid-summary, started age seconds ago."""
+    return json.dumps({'session_id': 'example', 'ts': int(time.time()) - age, 'status': 'inflight'}).encode('utf-8')
 
 
 # Digests of the V2 hooks every V3 release retires. The installer recognizes an untouched V2
@@ -238,6 +244,39 @@ class InstallLegacyExemptionTest(unittest.TestCase):
         manifest = json.loads((self.state / 'v3-install.json').read_text(encoding='utf-8'))
         self.assertEqual(manifest['kept_legacy'], ['.claude/scripts/flush.py'])
         self.assertNotIn('.claude/scripts/flush.py', manifest['files'])
+
+    def test_install_reports_flush_sentinels_whose_writer_died(self):
+        self.seed('.claude/scripts/flush.py', CUSTOM_RUNNER)
+        record = flush_sentinel(age=7200)
+        sentinel = self.seed('.claude/scripts/.state/flush-example.json', record)
+        self.seed('.claude/scripts/.state/flush-example.lock', b'')
+        result = self.cli('--keep-customized-legacy', '.claude/scripts/flush.py')
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
+        orphaned = ['.claude/scripts/.state/flush-example.json']
+        self.assertEqual(json.loads(result.stdout)['orphaned_legacy_state'], orphaned)
+        self.assertEqual(sentinel.read_bytes(), record)
+        receipt = json.loads((self.state / 'v2-migration.json').read_text(encoding='utf-8'))
+        self.assertEqual(receipt['orphaned_legacy_state'], orphaned)
+
+    def test_install_stops_on_a_recent_flush_sentinel_even_with_its_lock_free(self):
+        # A flush still running on another machine that syncs this vault looks exactly like this
+        # here: the sentinel arrived, and nothing on this machine holds its lock.
+        self.seed('.claude/scripts/flush.py', CUSTOM_RUNNER)
+        record = flush_sentinel(age=30)
+        sentinel = self.seed('.claude/scripts/.state/flush-example.json', record)
+        self.seed('.claude/scripts/.state/flush-example.lock', b'')
+        before = snapshot(self.vault)
+        result = self.cli('--keep-customized-legacy', '.claude/scripts/flush.py')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b'')
+        error = json.loads(result.stderr)
+        self.assertEqual(error['error'], 'RuntimeError')
+        self.assertRegex(error['message'], r'\.claude/scripts/\.state/flush-example\.json; its lock is free here.*'
+                                           r'60 minutes old.*Rerun once it is older, or reconcile')
+        self.assertNotIn(str(self.base), error['message'])
+        self.assertEqual(sentinel.read_bytes(), record)
+        self.assertEqual(snapshot(self.vault), before)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
 
     def test_keeping_one_runner_does_not_exempt_another(self):
         self.seed('.claude/scripts/flush.py', CUSTOM_RUNNER)

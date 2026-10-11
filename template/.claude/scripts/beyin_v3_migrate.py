@@ -6,8 +6,17 @@ import json
 import os
 from pathlib import Path
 import shutil
+import time
 
 LEGACY_RUNNERS = ['.claude/scripts/flush.py', '.claude/scripts/compile.py'] + ['.claude/hooks/'+name+suffix for name in ('session-start', 'session-end', 'pre-compact', 'prompt-counter') for suffix in ('.sh', '.ps1')]
+
+# How old a flush sentinel has to be, by the start time it recorded, before a free lock is taken
+# as proof that its writer died. A stock V2 flush is done within about ten minutes of taking its
+# lock (two model attempts of at most 270 seconds each), a little later when it first waited for
+# another flush of the same session, and V2 itself sweeps a flush's hook input after this same
+# hour (STALE_HOOK_INPUT_SECONDS in flush.py).
+ORPHANED_FLUSH_SECONDS = 3600
+RECONCILE_HINT = ' with no V2 writer running, set its status to a terminal value such as "fail" and rerun'
 
 
 def _hash(path):
@@ -73,12 +82,16 @@ def migration_guard(vault_root, state_dir):
     if state.is_relative_to(vault):
         raise ValueError('migration state must be outside vault')
     legacy = _legacy_root(vault)
+    orphaned = []
     with ExitStack() as stack:
         if legacy.exists():
+            held = set()
             for path in sorted(legacy.glob('*.lock')):
                 if path.is_symlink():
                     raise RuntimeError('legacy writer lock symlink requires review')
                 stack.enter_context(_legacy_lock(path))
+                held.add(path.name)
+            now = time.time()
             for path in legacy.glob('*.json'):
                 if not path.name.startswith(('flush-', 'compile', 'antigravity-')):
                     continue
@@ -88,13 +101,42 @@ def migration_guard(vault_root, state_dir):
                     raise RuntimeError('legacy writer state unreadable; review locally')
                 if isinstance(item, dict) and any(item.get(key) in ('inflight', 'running', 'pending') for key in ('status', 'state')):
                     relative = path.relative_to(vault).as_posix()
+                    # Every V2 release that writes status "inflight" to flush-<key>.json takes
+                    # flush-<key>.lock first and keeps it until its terminal status, so on this
+                    # machine holding that lock proves the writer is gone (a logout or shutdown
+                    # mid-summary), which the sentinel's age alone never was. No other record or
+                    # state has that guarantee: stock V2 writes none of them, so whatever left
+                    # one follows rules this guard does not know.
+                    if (path.name.startswith('flush-') and item.get('status') == 'inflight'
+                            and item.get('state') not in ('inflight', 'running', 'pending')
+                            and path.with_suffix('.lock').name in held):
+                        # The lock is only as wide as this machine and this lock interface, and
+                        # the state directory travels with a synced vault: a flush that is still
+                        # running on another machine leaves the same sentinel beside a lock that
+                        # is free here, and one under WSL next to a Windows Python may too. Such a
+                        # writer is done within minutes of the start time it recorded, so the proof
+                        # also needs that time to be an hour old. A record without it is not a
+                        # stock sentinel.
+                        started = item.get('ts')
+                        if (isinstance(started, (int, float)) and not isinstance(started, bool)
+                                and 0 <= started <= now - ORPHANED_FLUSH_SECONDS):
+                            orphaned.append(relative)
+                            continue
+                        raise RuntimeError('legacy writer inflight sentinel in ' + relative +
+                                           '; its lock is free here, but its start time (ts) is missing or less than '
+                                           + str(ORPHANED_FLUSH_SECONDS // 60) + ' minutes old, so a flush on another'
+                                           ' machine that syncs this vault is not ruled out. Rerun once it is older,'
+                                           ' or reconcile that record before migration:' + RECONCILE_HINT)
                     raise RuntimeError('legacy writer inflight sentinel in ' + relative +
-                                       '; verify the prior write completed, then reconcile that record before migration')
+                                       '; verify the prior write completed, then reconcile that record before migration:'
+                                       + RECONCILE_HINT)
         sources, states = _inventory(vault)
         prior = state/'v2-migration.json'
         plan = {'migration': 'v2-to-v3-source-cutover-1', 'cutover_at': datetime.now(timezone.utc).isoformat(),
                 'sources': sources, 'legacy_state': states,
                 'historical_receipts': sorted(p.relative_to(vault).as_posix() for p in (vault/'receipts').glob('*.md'))}
+        if orphaned:
+            plan['orphaned_legacy_state'] = sorted(orphaned)
         if prior.exists():
             plan['previous'] = json.loads(prior.read_text(encoding='utf-8'))
         # Runners the user kept at install time stay theirs on every later update.
