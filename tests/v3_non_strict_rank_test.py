@@ -63,7 +63,7 @@ class NonStrictRankTest(unittest.TestCase):
         self.ingest('about', about, 'knowledge/rollback.md', '2026-09-01T10:00:00Z')
         self.assertEqual(self.ids('rollback plan')[:2], ['about', 'mention'])
 
-    def test_strict_thresholds_unchanged(self):
+    def test_long_hub_single_keyword_stays_below_strict_weight_floor(self):
         self.assertEqual(self.ids('budget', strict=True), [])
 
 
