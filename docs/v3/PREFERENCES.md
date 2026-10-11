@@ -77,6 +77,12 @@ Bu değişiklik yerel adaydır; yayımlanmış v3.0.0 paketine otomatik olarak e
 - Blok salt okunur SQLite okumasıyla kurulur; model çağrısı ve yazma yoktur. Okuma başarısız olursa yalnız bu blok düşer, köprünün başlangıç talimatı aynen verilir.
 - Ayar, eski sürümler bilinmeyen tercih alanını reddettiği için `.beyin-preferences.json` içinde değil, runtime klasöründeki `project-context.json` dosyasında tutulur; makineye özeldir ve rollback güvenlidir. Kapatmak için `--project-context off`.
 
+## Hassas klasörlerin korunması
+
+Adında `Kasa`, `Şifreler`, `Müşteriler`, `Özel`, `Private` gibi hassasiyet bildiren bir sözcük bulunan klasörler ana hafıza taramasına alınmaz. Aynı kural alt klasörlerde de geçerlidir; Türkçe harfler, büyük/küçük harfler ve baştaki emoji veya numaralar fark etmez. Bu dosyalar silinmez ya da değiştirilmez.
+
+Eski sürümden kalan bir indeks henüz senkronize edilmemiş olsa bile bu klasörlerdeki kaynaklar otomatik hafıza bağlamında gösterilmez. Bu kaynaklara bağlı receipt özetleri de otomatik açılış bağlamından çıkarılır. Görünür bir hafıza kaydı istiyorsan dosyayı hassas klasör dışında tutmalısın. `visibility: private` kişisel notlar için ayrıca kullanılabilir; yalnızca klasör adı, dosyanın işletim sistemi ve Git izinlerini değiştirmez.
+
 ## Opt-in hijyen sinyalleri
 
 Üç sinyal vardır ve üçü de varsayılan olarak kapalıdır; açılmadıkça hook çıktısı ve `doctor` raporu değişmez:
