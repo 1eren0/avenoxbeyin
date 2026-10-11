@@ -923,7 +923,11 @@ class MemoryStore:
         scopes = read_project_scopes(self.vault_root) if project is not None else None
         eligible = []
         stale_count = 0
+        from beyin_v3_hygiene import sensitive_source
         for record in records:
+            # Old indexes can still hold these notes until the next sync. Never deliver them.
+            if sensitive_source(record.get("source")):
+                continue
             if record["visibility"] not in allowed or record.get("trust") == "untrusted" or record.get("trusted") is False or record.get("status") == "untrusted" or record.get("kind") == "untrusted" or _rejected_inference(record) != rejected_only:
                 continue
             if project is not None:
