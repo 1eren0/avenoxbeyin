@@ -52,14 +52,15 @@ Web Clipper sayfayı tarayıcının içinden okur; giriş isteyen sayfalar (Gmai
 1. **Yakala.** Kısayola bas. Pencere neyin kaydedileceğini gösterir: tarayıcıdaki sayfa
    (Mac'te Chrome, Arc, Brave, Edge, Safari), Finder'da seçili dosya ya da panodaki metin.
    İstersen tek satır "neden" yaz, Enter. Esc vazgeçer.
-2. **İşlet.** Ajanına "yakalananları işle" de. Oturum başında bekleyen kaynak sayısı da görünür.
 
-**Windows'ta ekran görüntüsü.** Panoda görüntü varsa (örneğin `Win+Shift+S` ile alınan ekran
-görüntüsü) pencere onu küçük önizlemesiyle gösterir; Enter görüntüyü `Yakala/dosyalar/` altına PNG
-olarak kaydeder ve Gönder > Beyne At ile aynı dosya kartını açar. `Tab` ya da karta tıklamak görüntüyü
-çıkarır, bir daha basınca geri ekler. Ekran görüntüsü 10 dakikadan eskiyse pencere onu yine gösterir
-ama kapalı başlatır, yani eski bir görüntü yazdığın nota kendiliğinden karışmaz; eklemek için `Tab`.
-Panoda metin ya da bağlantı varsa eskisi gibi o yakalanır.
+   Windows'ta panoda görüntü varsa (örneğin `Win+Shift+S` ile alınan ekran görüntüsü) pencere
+   onu küçük önizlemesiyle gösterir; Enter görüntüyü kartların yanındaki `dosyalar/` klasörüne
+   PNG olarak kaydeder ve Gönder > Beyne At ile aynı dosya kartını açar. `Tab` ya da karta
+   tıklamak görüntüyü çıkarır, bir daha basınca geri ekler. Ekran görüntüsü 10 dakikadan eskiyse
+   pencere onu yine gösterir ama kapalı başlatır, yani eski bir görüntü yazdığın nota
+   kendiliğinden karışmaz; eklemek için `Tab`. Panoda metin ya da bağlantı varsa eskisi gibi o
+   yakalanır.
+2. **İşlet.** Ajanına "yakalananları işle" de. Oturum başında bekleyen kaynak sayısı da görünür.
 
 Her yakalama `📥 000-Inbox/Yakala/` içinde bir kart olur. Aynı videoyu ya da sayfayı ikinci kez
 yakalarsan yeni kart açılmaz; yeni notun aynı karta eklenir.
