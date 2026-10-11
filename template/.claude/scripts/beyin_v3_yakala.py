@@ -919,9 +919,45 @@ def windows_context():
             if kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)):
                 name = Path(path.value).stem
             kernel32.CloseHandle(process)
-        return {'uygulama': name, 'pencere': buffer.value}
+        context = {'uygulama': name, 'pencere': buffer.value}
+        if name and name.lower() in WIN_CHROMIUM:
+            url = windows_browser_url(window)
+            if url:
+                context['url'] = url
+                context['baslik'] = re.sub(r'\s+[-–—]\s+[^-–—]+$', '', buffer.value).strip() or None
+        return context
     except Exception:
         return {}
+
+
+WIN_CHROMIUM = {'chrome', 'brave', 'msedge', 'vivaldi', 'opera', 'opera_gx', 'chromium', 'arc'}
+_ADDRESS_BAR = r'''
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
+$w = [Windows.Automation.AutomationElement]::FromHandle([IntPtr]%d)
+$c = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
+$e = $w.FindFirst([Windows.Automation.TreeScope]::Descendants, $c)
+if ($e) { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $e.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value }
+'''
+
+
+def windows_browser_url(window):
+    """Active tab URL of a Chromium browser, read from its address bar through UI Automation.
+
+    Chromium hides the scheme, so a bare host/path gains https://. Anything that is not a
+    plain link (a half-typed search, chrome:// pages) yields None and the popup falls back to the clipboard.
+    """
+    try:
+        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', _ADDRESS_BAR % int(window)],
+                                capture_output=True, timeout=4, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = result.stdout.decode('utf-8', 'replace').strip() if result.returncode == 0 else ''
+    if not value or re.search(r'\s', value):
+        return None
+    if not re.match(r'[a-z][a-z0-9+.-]*://', value, re.I):
+        value = 'https://' + value
+    parsed = urlparse(value)
+    return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
 
 
 def _try(command, timeout=5):

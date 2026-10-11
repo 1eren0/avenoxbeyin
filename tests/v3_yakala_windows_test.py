@@ -171,6 +171,32 @@ class JsonTextTest(unittest.TestCase):
                          '{\n  "ad": "x\\udcff"\n}')
 
 
+class BrowserUrlTest(unittest.TestCase):
+    """The active tab's link comes from the Chromium address bar; anything else is not a link."""
+
+    def read(self, value, code=0):
+        done = subprocess.CompletedProcess([], code, stdout=value.encode('utf-8'), stderr=b'')
+        with patch.object(yakala.subprocess, 'run', return_value=done) as run:
+            url = yakala.windows_browser_url(42)
+        self.assertIn('FromHandle([IntPtr]42)', run.call_args.args[0][-1])
+        return url
+
+    def test_address_bar_values(self):
+        self.assertEqual(self.read('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
+        self.assertEqual(self.read('http://127.0.0.1:8080/x'), 'http://127.0.0.1:8080/x')
+        self.assertEqual(self.read('https://github.com/avenoxai'), 'https://github.com/avenoxai')
+        self.assertIsNone(self.read('yarim kalmis arama'))
+        self.assertIsNone(self.read('brave://settings'))
+        self.assertIsNone(self.read('localhost'))
+        self.assertIsNone(self.read(''))
+        self.assertIsNone(self.read('github.com', code=1))
+
+    def test_powershell_missing_or_slow_gives_nothing(self):
+        for error in (OSError('yok'), subprocess.TimeoutExpired('powershell.exe', 4)):
+            with patch.object(yakala.subprocess, 'run', side_effect=error):
+                self.assertIsNone(yakala.windows_browser_url(42))
+
+
 class FakeSession:
     """What the listener uses of one logon session: named events and mutexes with handle
     counts, the hotkey table and one message queue per thread. Serves as user32 and kernel32."""
