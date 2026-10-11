@@ -111,6 +111,8 @@ class HookDoneLedgerTest(unittest.TestCase):
     def test_invalid_or_symlinked_file_is_never_deleted(self):
         key, invalid = self.marker("invalid")
         invalid.write_text("{bad-json", encoding="utf-8")
+        stamp = time.time() - ledger.RETENTION_SECONDS - 60
+        os.utime(invalid, (stamp, stamp))
         external = self.root / "outside.json"
         external.write_text('{"harness":"claude","event":"Stop"}', encoding="utf-8")
         link = self.done / (hashlib.sha256(b"link").hexdigest() + ".json")
