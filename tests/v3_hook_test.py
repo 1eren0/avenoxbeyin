@@ -719,8 +719,18 @@ class HookInstallerTest(unittest.TestCase):
                                    text=True, encoding='utf-8', capture_output=True,
                                    cwd=self.vault, env=self.env, timeout=20)
             self.assertEqual(probe.returncode, 0, probe.stderr)
-            # Running the whole encoded command through Git Bash returned exit 0 with empty stdout on
-            # the Windows runners (#238 CI); kept out until it is reproduced on a real Windows client (#204).
+            # The whole encoded command, not only its launcher, must survive Git Bash (#204), as a plain
+            # and as a login shell. Without PATHEXT Windows PowerShell does not run python.exe as a
+            # console program: the command returns exit 0 with no output and leaves a process behind
+            # (measured on the runners). cmd.exe supplies PATHEXT when it is missing, Git Bash passes the
+            # environment on as it is, so this cleared environment has to carry it like a real session does.
+            bash_env = dict(self.env, PATHEXT=os.environ.get('PATHEXT') or '.COM;.EXE;.BAT;.CMD')
+            for flag in ('-c', '-lc'):
+                through_bash = subprocess.run([bash, flag, str(command)], input=payload, text=True, encoding='utf-8',
+                                              capture_output=True, cwd=self.vault, env=bash_env, timeout=30)
+                self.assertEqual(through_bash.returncode, 0, (flag, through_bash.stderr))
+                self.assertIn('Synthetic Reviewer',
+                              json.loads(through_bash.stdout)['hookSpecificOutput']['additionalContext'], flag)
             result = subprocess.run(command, shell=True, input=payload, text=True, encoding='utf-8',
                                     capture_output=True, cwd=self.vault, env=self.env, timeout=20)
         else:
