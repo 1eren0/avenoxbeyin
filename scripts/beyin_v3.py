@@ -408,7 +408,9 @@ def parser():
     root.add_argument("--state", type=Path, help="Local state directory outside the vault")
     sub = root.add_subparsers(dest="command", required=True)
     sub.add_parser("init", help="Initialize local state; installs no hooks or services")
-    sub.add_parser("sync", help="Reconcile Markdown sources into local state")
+    sync_parser = sub.add_parser("sync", help="Reconcile Markdown sources into local state")
+    sync_parser.add_argument("--full", action="store_true",
+                             help="Read every source instead of trusting unchanged file signatures")
     sub.add_parser("skill-sync", help="Reconcile project-local shared skills")
     sub.add_parser("doctor", help="Read local hook health and pending metadata counts")
     recap = sub.add_parser("recap", help="Read recent source-linked outcomes without a model call")
@@ -894,7 +896,7 @@ def main(argv=None, return_result=False):
                 # Index the shorter sources and the private archive before anyone reads them.
                 result['sync'] = {'status': load_sync()(vault, state).sync().get('status')}
         elif args.command == "sync":
-            result = sync.sync()
+            result = sync.sync(full=True) if args.full else sync.sync()
         elif args.command == "recap":
             days = 7 if args.days is None else args.days
             if not 1 <= days <= 366 or not 1 <= args.limit <= 100:

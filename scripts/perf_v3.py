@@ -31,6 +31,7 @@ import random
 import re
 import runpy
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
@@ -273,9 +274,12 @@ def replace_tree(source, destination):
     shutil.copytree(source, destination)
 
 
-def wait_file(path, timeout=60):
+def wait_file(path, timeout=60, process=None):
     deadline = time.monotonic() + timeout
     while not path.exists():
+        if process and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise RuntimeError(f'Process exited early ({process.returncode}):\n{stderr}')
         if time.monotonic() >= deadline:
             raise RuntimeError(f'Timed out waiting for {path.name}')
         time.sleep(0.01)
@@ -288,6 +292,10 @@ def lock_worker(vault, state, coordination, role):
     scheduler race of two fast compactions. Startup is excluded from lock wait.
     """
     modules(vault)
+    # modules() leaves sys.path as it found it; compact imports its siblings from the installed copy.
+    directory = str(Path(vault) / '.claude/scripts')
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
     compact = importlib.import_module('beyin_v3_compact')
     original = compact._compact_lock
     coordination = Path(coordination)
@@ -362,6 +370,32 @@ class Benchmark:
     def reset(self):
         replace_tree(self.pristine, self.root / 'work')
 
+    def settle(self):
+        """Steady state of the stat signatures (#251): the restored files as if left alone.
+
+        A signature is trusted from its second read, two seconds after the first, and never
+        for a file changed within the last two seconds. Every repeat restores the vault by
+        copy, so without this step the warm scenarios would time the first syncs after an
+        install, which read every source. The rewarm sync was the first read; this untimed
+        one runs on a clock moved past the window instead of sleeping. On a tree without
+        signatures it is one more warm sync.
+        """
+        window = getattr(self.sync, 'RACY_WINDOW_NS', None)
+        if window is None:
+            return
+        real = time.time_ns
+        with patch.object(self.sync.time, 'time_ns', side_effect=lambda: real() + window + 1_000_000_000):
+            settled = self.engine().sync()
+        assert not settled['conflicts'], settled
+
+    def trusted_signatures(self):
+        """How many sources the next sync can skip; None on a tree without signatures."""
+        with self.engine().store._connect() as db:
+            try:
+                return db.execute("SELECT COUNT(*) FROM source_signatures WHERE payload_sha256 != ''").fetchone()[0]
+            except sqlite3.OperationalError:
+                return None
+
     def remote_receipt(self, event_id, summary, at=FIXED_DATE):
         # Another device's valid receipt, authored through the same engine API.
         other = self.root / 'other-device'
@@ -396,6 +430,7 @@ class Benchmark:
             # runtime cache key. Rewarm outside timing after each restoration.
             refreshed = self.engine().sync()
             assert not refreshed['conflicts'], refreshed
+            self.settle()
         if scenario == 'sync_cold':
             shutil.rmtree(self.state)
         elif scenario == 'sync_one_note':
@@ -455,7 +490,7 @@ class Benchmark:
                 processes.append(subprocess.Popen(command, cwd=self.vault, env=env,
                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE))
                 if role == 'first':
-                    wait_file(coordination / 'first-held')
+                    wait_file(coordination / 'first-held', process=processes[0])
             for process in processes:
                 stdout, stderr = process.communicate(timeout=60)
                 if process.returncode:
@@ -490,6 +525,7 @@ class Benchmark:
             checked(command, self.vault, self.env)
         elif scenario in SYNC_SCENARIOS:
             engine = self.engine()
+            details['trusted_signatures_before'] = self.trusted_signatures() if scenario != 'sync_cold' else None
             started = time.perf_counter()
             reports, timings = [], []
             for _ in range(3 if scenario == 'sync_divergent_repeat' else 1):
@@ -558,6 +594,7 @@ def run(args):
                       fixture=bench.fixture, environment=env_info(bench.vault, bench.fixture, args.repeat),
                       baseline_status=bench.baseline_status, scenarios={}, skipped_scenarios={},
                       measurement_notes=dict(reset='pristine vault, state and home copied before every repeat; untimed sync rebases directory identity caches for warm scenarios',
+                          signatures='warm scenarios start with settled stat signatures (second untimed sync on a clock past the racy window); trusted_signatures_before counts the sources a sync may skip; sync_cold and the first two syncs after an install or update read every source',
                           sync_one_receipt='real API authors receipt on synthetic second device; source copied before timing, measured index has not seen the new event',
                           sync_divergent_repeat='each sample is the total wall time of three sync calls; each must expose receipt_divergence',
                           lock_two_process='actual second-process lock acquisition wait; controlled 250ms holder overlap',

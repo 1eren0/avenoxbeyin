@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
+import stat
 import tempfile
 import sys
 import time
@@ -28,6 +30,38 @@ def _hash(data):
     return hashlib.sha256(data if isinstance(data, bytes) else data.encode()).hexdigest()
 
 
+def _read_only(path):
+    """True only for a file that carries the Windows read-only attribute.
+
+    Read from the file's own attributes: os.access also answers False for a target it cannot
+    query at all, such as one pending deletion, and that one is worth a retry.
+    """
+    try:
+        return bool(os.stat(path).st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+    except (OSError, AttributeError):
+        return False
+
+
+def _safe_replace(source, destination):
+    """os.replace, retried briefly only for a Windows sharing violation.
+
+    An antivirus scan, the search indexer or an editor can hold the target open for a few
+    milliseconds there (WinError 5/32/33): four retries, 225 ms in all. A POSIX
+    PermissionError is a real EACCES/EPERM and is raised at once, as is any other error and
+    WinError 5 for a read-only target, which no wait will lift (#230).
+    """
+    attempts = 5 if os.name == 'nt' else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            if (attempt == attempts - 1 or getattr(exc, 'winerror', None) not in (5, 32, 33)
+                    or _read_only(destination)):
+                raise
+            time.sleep(0.015 * (2 ** attempt))
+
+
 def atomic(path, text):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,7 +71,7 @@ def atomic(path, text):
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(name, path)
+        _safe_replace(name, path)
         try:
             directory = os.open(path.parent, os.O_RDONLY)
             try:
@@ -280,6 +314,128 @@ def _has_conflict_markers(text):
         elif stage == 2 and line.startswith('>>>>>>>'):
             return True
     return False
+
+
+# Warm syncs skip reading a source whose bytes were already indexed (#233). The signature is
+# size, mtime, ctime and file id: on POSIX ctime moves with every content or utime change, on
+# Windows st_ctime is the creation time and st_ino the file index, so an atomic save (a new
+# file) changes both. FAT and exFAT have no change time (st_ctime follows mtime there) and
+# FAT keeps 2 s timestamps, HFS+ and some cloud drives 1 s: a second write in the same tick
+# can leave the whole signature as it was. So, as in git's racy-clean rule, a signature is trusted
+# only for bytes read RACY_WINDOW_NS after the source last changed, and that is established
+# twice: by the file's own timestamps against this machine's clock, and by a second read of
+# the same signature RACY_WINDOW_NS after it was first seen. The second proof compares this
+# clock only with itself, so it also holds where another clock stamps the files (a file
+# server, a VM shared folder) and runs behind this one.
+SIGNATURE_SCHEMA = 'source-signatures/2'
+RACY_WINDOW_NS = 2_000_000_000
+
+
+def _stat_signature(st):
+    # File ids can exceed SQLite's 64-bit INTEGER (ReFS); they are stored as text.
+    return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, str(st.st_ino))
+
+
+def _signature_epoch():
+    """Identify the code that turns bytes into a record; an install, update or rollback rewrites it."""
+    parts = [SIGNATURE_SCHEMA]
+    for module in (__file__, sys.modules[MemoryStore.__module__].__file__):
+        st = os.stat(module)
+        parts.append(f'{st.st_size}:{st.st_mtime_ns}:{st.st_ino}')
+    return '|'.join(parts)
+
+
+class _SignatureCache:
+    """Per-sync view of source_signatures, inside the sync's BEGIN IMMEDIATE transaction.
+
+    A hit stands for the indexed payload itself, so it must be the record a full read would
+    build: the stat signature matches the one taken before those bytes were read,
+    markdown_sources still assigns the id to this source, and the payload is byte for byte
+    the one written (or confirmed) from that read. The payload hash also catches any other
+    writer of the row, e.g. a rolled back version without this table re-indexing the source.
+
+    A row with an empty payload_sha256 is a signature seen once (at seen_ns): it is never a
+    hit, it only lets a later read of the same signature settle it. Rows of sources the walk
+    did not reach (deleted, renamed, in a directory that became excluded) are removed, so a
+    source that comes back is read.
+    """
+
+    COLUMNS = 'source, id, size, mtime_ns, ctime_ns, ino, payload_sha256, seen_ns'
+
+    def __init__(self, db, sources, payloads, full=False):
+        self.db, self.sources, self.payloads = db, sources, payloads
+        self.started = time.time_ns()
+        self.rows, self.kept, self.pending = {}, {}, {}
+        self.full = full
+        try:
+            epoch = _signature_epoch()
+        except (OSError, AttributeError, KeyError, TypeError):
+            epoch = None
+        self.enabled = epoch is not None
+        stored = db.execute("SELECT value FROM metadata WHERE key='source_signature_epoch'").fetchone()
+        if epoch is not None and stored is not None and stored[0] == epoch:
+            try:
+                self.rows = {row[0]: tuple(row[1:]) for row in db.execute(f'SELECT {self.COLUMNS} FROM source_signatures')}
+                return
+            except sqlite3.OperationalError:
+                pass
+        # New or unknown code, or no table yet: no stored signature is trusted.
+        db.execute('DROP TABLE IF EXISTS source_signatures')
+        db.execute('CREATE TABLE source_signatures(source TEXT PRIMARY KEY, id TEXT NOT NULL, size INTEGER NOT NULL, '
+                   'mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, ino TEXT NOT NULL, payload_sha256 TEXT NOT NULL, '
+                   'seen_ns INTEGER NOT NULL)')
+        if epoch is None:
+            db.execute("DELETE FROM metadata WHERE key='source_signature_epoch'")
+        else:
+            db.execute("INSERT OR REPLACE INTO metadata VALUES ('source_signature_epoch',?)", (epoch,))
+
+    def lookup(self, relative, st):
+        """The indexed id when the source need not be read, else None."""
+        row = self.rows.get(relative)
+        if self.full or row is None or not row[5] or row[1:5] != _stat_signature(st):
+            return None
+        id, payload = row[0], self.payloads.get(row[0])
+        if payload is None or self.sources.get(id) != relative or _hash(payload) != row[5]:
+            return None
+        self.kept[relative] = row
+        return id
+
+    def read(self, relative, st, id):
+        """Note a source that was just read into a record; `st` was taken before its bytes."""
+        if not self.enabled:
+            return
+        signature, now, row = _stat_signature(st), time.time_ns(), self.rows.get(relative)
+        # When this signature was first seen. A time ahead of the clock (it was set back) starts over.
+        seen = row[6] if row is not None and row[1:5] == signature and row[6] <= now else now
+        # Settled: both proofs put this read RACY_WINDOW_NS after the last change. Otherwise the
+        # row only remembers the sighting and the source is read again next time.
+        settled = (seen <= self.started - RACY_WINDOW_NS
+                   and max(st.st_mtime_ns, st.st_ctime_ns) < self.started - RACY_WINDOW_NS)
+        self.pending[relative] = (id, signature, seen, settled)
+
+    def save(self, indexed):
+        """Record a signature for each read source whose payload is now indexed and owned by it.
+
+        One statement per kind of change, so the SQL of a sync does not grow with the vault.
+        """
+        rows = dict(self.kept)
+        for source, (id, signature, seen, settled) in self.pending.items():
+            if id in indexed:
+                rows[source] = (id, *signature, _hash(indexed[id]) if settled else '', seen)
+        stale = sorted(self.rows.keys() - rows.keys())
+        changed = [[source, *row] for source, row in sorted(rows.items()) if self.rows.get(source) != row]
+        try:
+            if stale:
+                self.db.execute('DELETE FROM source_signatures WHERE source IN (SELECT value FROM json_each(?))',
+                                (json.dumps(stale),))
+            if changed:
+                self.db.execute(f'INSERT OR REPLACE INTO source_signatures({self.COLUMNS}) SELECT '
+                                + ', '.join(f"json_extract(value, '$[{index}]')" for index in range(8))
+                                + ' FROM json_each(?)', (json.dumps(changed, ensure_ascii=False),))
+        except sqlite3.OperationalError:
+            # SQLite built without JSON functions.
+            self.db.executemany('DELETE FROM source_signatures WHERE source=?', [(source,) for source in stale])
+            self.db.executemany(f'INSERT OR REPLACE INTO source_signatures({self.COLUMNS}) VALUES (?,?,?,?,?,?,?,?)', changed)
 
 
 class SyncEngine:
@@ -564,7 +720,9 @@ class SyncEngine:
         dead = resolve_supersedes(records)[1]
         return {'dead_count': len(dead), 'dead': dead[:20], 'truncated': len(dead) > 20}
 
-    def _scan(self):
+    def _scan(self, cache=None):
+        """Read every source. With sync's signature cache, an unchanged indexed source is not read
+        and its value in the returned records is None: sync keeps that record as indexed."""
         records, warnings, conflicts = {}, [], []
         duplicate = set()
         # Read once per sync, not per directory: the config cannot change mid-walk.
@@ -584,7 +742,17 @@ class SyncEngine:
                 path = Path(directory) / name
                 relative = path.relative_to(self.root).as_posix()
                 try:
+                    # Path proof first: an outside-vault or symlinked source keeps its rejection reason.
                     path, resolved = self._scan_path(relative)
+                    if cache is not None:
+                        st = os.stat(resolved)
+                        id = cache.lookup(relative, st)
+                        if id is not None:
+                            # Not decoded: sync leaves an unchanged indexed record as it is.
+                            if id in records:
+                                duplicate.add(id)
+                            records[id] = None
+                            continue
                     raw = path.read_bytes()
                     text = raw.decode('utf-8')
                     if _has_conflict_markers(text):
@@ -603,6 +771,8 @@ class SyncEngine:
                     if record['id'] in records:
                         duplicate.add(record['id'])
                     records[record['id']] = record
+                    if cache is not None:
+                        cache.read(relative, st, record['id'])
                 except (ValueError, OSError, UnicodeError) as exc:
                     warnings.append({'source': relative, 'reason': str(exc)})
         for id in sorted(duplicate):
@@ -714,19 +884,21 @@ class SyncEngine:
             db.execute("INSERT OR REPLACE INTO metadata VALUES ('receipt_scan_signature',?)", (signature,))
         return warnings, conflicts
 
-    def sync(self):
+    def sync(self, full=False):
+        """Index the vault. `full` reads every source: no stored stat signature is taken on trust."""
         # Serialize recovery, source scan and projection across local processes.
         with self.store._connect() as db:
             db.execute('BEGIN IMMEDIATE')
             completed, recovery_conflicts = self._recover(db)
             receipt_warnings, receipt_conflicts = self._scan_receipts(db)
-            records, warnings, conflicts = self._scan()
-            warnings.extend(receipt_warnings)
-            conflicts.extend(recovery_conflicts + receipt_conflicts)
             old_sources = dict(db.execute('SELECT id, source FROM markdown_sources ORDER BY id'))
             # Match the old covering-ID scan's set construction and deletion event order.
             old_owned = {id for id in old_sources}
             old_payloads = dict(db.execute('SELECT id, payload FROM records'))
+            cache = _SignatureCache(db, old_sources, old_payloads, full=full)
+            records, warnings, conflicts = self._scan(cache)
+            warnings.extend(receipt_warnings)
+            conflicts.extend(recovery_conflicts + receipt_conflicts)
             deleted = 0
             for id in old_owned - records.keys():
                 previous_payload = old_payloads.get(id)
@@ -736,7 +908,11 @@ class SyncEngine:
                     db.execute('DELETE FROM records WHERE id=?', (id,))
                     deleted += 1
                 db.execute('DELETE FROM markdown_sources WHERE id=?', (id,))
+            indexed = {}
             for id, record in records.items():
+                if record is None:
+                    # A signature cache hit: the indexed payload itself, owned by this source.
+                    continue
                 previous_payload = old_payloads.get(id)
                 if previous_payload is not None and id in old_owned:
                     previous = json.loads(previous_payload)
@@ -754,6 +930,8 @@ class SyncEngine:
                     db.execute('INSERT INTO events(event_type,record_id,revision,record) VALUES (?,?,?,?)', (event_type, id, record['revision'], payload))
                 if old_sources.get(id) != record['source']:
                     db.execute('INSERT OR REPLACE INTO markdown_sources VALUES (?,?)', (id, record['source']))
+                indexed[id] = payload
+            cache.save(indexed)
             conflicts.extend(project_receipts(self, db, warnings))
             # A supersedes value that retires nothing is reported, not a degraded scan: no
             # source was excluded and the hook must not warn on every turn about it.
