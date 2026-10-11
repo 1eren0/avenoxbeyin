@@ -751,7 +751,42 @@ def repair_mojibake(text):
     return text
 
 
+CLIP_LIMIT = 1_000_000  # bytes taken from a clipboard helper: a card is a note, not a file transfer
+CLIP_TIMEOUT = 2  # seconds: the window must not wait on a clipboard owner that never answers
+CLIP_CUT = '\n\n[Pano metni 1 MB sınırında kesildi.]'
+
+
+def _tool_text(command):
+    """Text printed by a clipboard helper; '' when it fails, is missing or hangs. Never raises.
+
+    The bytes are decoded as UTF-8 here. With `text=True` a Latin-5 locale garbles Turkish and
+    one stray byte raises UnicodeDecodeError, which closes the window before it opens.
+    """
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=CLIP_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    if result.returncode != 0:
+        return ''
+    text = result.stdout[:CLIP_LIMIT].decode('utf-8', 'replace')
+    return text.rstrip('\ufffd') + CLIP_CUT if len(result.stdout) > CLIP_LIMIT else text
+
+
+def _wl_paste():
+    """Wayland clipboard as text; None when this is not a Wayland session or wl-clipboard is missing.
+
+    Tk runs through XWayland and can fail there with "CLIPBOARD selection doesn't exist" (#278).
+    `--type text` matters: without it wl-paste hands over whatever is offered, image bytes
+    included. Nothing copied, or only an image, is a non-zero exit and reads as ''.
+    """
+    tool = _which('wl-paste') if os.environ.get('WAYLAND_DISPLAY') else None
+    return _tool_text([tool, '--no-newline', '--type', 'text']) if tool else None
+
+
 def _clipboard(root):
+    value = _wl_paste()
+    if value:
+        return repair_mojibake(value)
     try:
         value = root.clipboard_get()
     except Exception:

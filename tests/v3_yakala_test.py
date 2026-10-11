@@ -4,6 +4,7 @@ Offline: `isle` runs with every helper tool hidden, so nothing reaches the netwo
 popup/hotkey paths are never started.
 """
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +32,110 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertEqual(yakala.canonical('https://youtu.be/abc123?t=40'), yakala.canonical('https://www.youtube.com/watch?v=abc123&list=x'))
         self.assertEqual(yakala.canonical('https://twitter.com/a/status/42'), yakala.canonical('https://x.com/b/status/42?s=20'))
         self.assertNotEqual(yakala.canonical('https://a.com/x'), yakala.canonical('https://a.com/y'))
+
+    def test_clipboard_prefers_wl_paste_on_wayland(self):
+        class Tk:
+            def clipboard_get(self):
+                raise RuntimeError('XWayland cannot see the Wayland clipboard')
+
+        done = subprocess.CompletedProcess([], 0, stdout=b'https://example.com/x', stderr=b'')
+        with patch.dict('os.environ', {'WAYLAND_DISPLAY': 'wayland-1'}), \
+                patch.object(yakala.shutil, 'which', return_value='/usr/bin/wl-paste'), \
+                patch.object(yakala.subprocess, 'run', return_value=done):
+            self.assertEqual(yakala._clipboard(Tk()), 'https://example.com/x')
+        empty = subprocess.CompletedProcess([], 1, stdout=b'', stderr=b'Nothing is copied')
+        with patch.dict('os.environ', {'WAYLAND_DISPLAY': 'wayland-1'}), \
+                patch.object(yakala.shutil, 'which', return_value='/usr/bin/wl-paste'), \
+                patch.object(yakala.subprocess, 'run', return_value=empty):
+            self.assertEqual(yakala._clipboard(Tk()), '')
+
+    class _Tk:
+        """Stands in for the Tk root: the X11 path that must still run when wl-paste gives nothing."""
+        def clipboard_get(self):
+            return 'tk panosu: Şifre'
+
+    def _wayland(self, run):
+        return (patch.dict('os.environ', {'WAYLAND_DISPLAY': 'wayland-1'}),
+                patch.object(yakala, '_which', return_value='/usr/bin/wl-paste'),
+                patch.object(yakala.subprocess, 'run', run))
+
+    def test_clipboard_falls_back_to_tk_when_wl_paste_gives_nothing(self):
+        def exits(code, out=b'', err=b''):
+            return lambda command, **kwargs: subprocess.CompletedProcess(command, code, out, err)
+
+        def raises(error):
+            def run(command, **kwargs):
+                raise error
+            return run
+        failures = {'nothing copied': exits(1, err=b'Nothing is copied\n'),
+                    'image only': exits(1, err=b'Clipboard content is not available as requested type "text"\n'),
+                    'empty text': exits(0),
+                    'stuck owner': raises(subprocess.TimeoutExpired(['wl-paste'], 2)),
+                    'cannot start': raises(PermissionError(13, 'denied'))}
+        for name, run in failures.items():
+            env, which, patched = self._wayland(run)
+            with self.subTest(name), env, which, patched:
+                self.assertEqual(yakala._clipboard(self._Tk()), 'tk panosu: Şifre')
+
+    def test_clipboard_runs_wl_paste_only_on_wayland(self):
+        with patch.dict('os.environ'), patch.object(yakala.subprocess, 'run') as run:
+            os.environ.pop('WAYLAND_DISPLAY', None)
+            with patch.object(yakala, '_which', return_value='/usr/bin/wl-paste') as which:
+                self.assertEqual(yakala._clipboard(self._Tk()), 'tk panosu: Şifre')
+            which.assert_not_called()  # macOS, Windows and X11 never look for the tool
+            os.environ['WAYLAND_DISPLAY'] = 'wayland-1'
+            with patch.object(yakala, '_which', return_value=None):  # wl-clipboard is not installed
+                self.assertIsNone(yakala._wl_paste())
+                self.assertEqual(yakala._clipboard(self._Tk()), 'tk panosu: Şifre')
+        run.assert_not_called()
+
+    def test_clipboard_wl_paste_call_and_decoding(self):
+        seen = []
+        out = {}
+
+        def run(command, **kwargs):
+            seen.append((command, kwargs))
+            return subprocess.CompletedProcess(command, 0, out['bytes'], b'')
+        env, which, patched = self._wayland(run)
+        with env, which, patched:
+            out['bytes'] = 'Müşteri Şifre Arşiv ığ İI\nikinci satır'.encode('utf-8')
+            self.assertEqual(yakala._clipboard(self._Tk()), 'Müşteri Şifre Arşiv ığ İI\nikinci satır')
+            out['bytes'] = b'caf\xe9 \xff\xfe son'  # Latin-1 text and stray bytes: replaced, never an exception
+            self.assertEqual(yakala._clipboard(self._Tk()), 'caf\ufffd \ufffd\ufffd son')
+            out['bytes'] = 'ş'.encode('utf-8') * yakala.CLIP_LIMIT  # twice the cap, cut in the middle of a letter
+            with patch.object(yakala, 'CLIP_LIMIT', yakala.CLIP_LIMIT + 1):
+                capped = yakala._wl_paste()
+            self.assertEqual(capped, 'ş' * (yakala.CLIP_LIMIT // 2) + yakala.CLIP_CUT)
+            out['bytes'] = b'a' * yakala.CLIP_LIMIT  # exactly at the cap: untouched
+            self.assertEqual(yakala._wl_paste(), 'a' * yakala.CLIP_LIMIT)
+        command, kwargs = seen[0]
+        self.assertEqual(command, ['/usr/bin/wl-paste', '--no-newline', '--type', 'text'])
+        self.assertEqual(kwargs.get('timeout'), yakala.CLIP_TIMEOUT)
+        self.assertFalse(kwargs.get('shell'))
+        self.assertFalse(kwargs.get('text') or kwargs.get('encoding') or kwargs.get('universal_newlines'))
+
+    @unittest.skipUnless(os.name == 'posix', 'the stand-in wl-paste is a shell script')
+    def test_clipboard_with_a_real_wl_paste_process(self):
+        tool = Path(self.tmp.name) / 'bin/wl-paste'
+        tool.parent.mkdir()
+        tool.write_text('#!/bin/sh\ncase "$FAKE_WL" in\n'
+                        '  args) printf "%s|" "$@" ;;\n'
+                        "  latin) printf 'caf\\351 \\377' ;;\n"
+                        '  empty) echo "Nothing is copied" >&2; exit 1 ;;\n'
+                        '  stuck) sleep 5 & wait ;;\n'  # like wl-paste: a child (cat) holds the pipe
+                        "  *) printf 'https://ornek.com/%%C5%%9F?a=1&b=2' ;;\nesac\n", encoding='utf-8', newline='\n')
+        tool.chmod(0o755)
+
+        def read(mode, timeout=60):
+            path = str(tool.parent) + os.pathsep + os.environ.get('PATH', '')
+            with patch.dict('os.environ', {'PATH': path, 'WAYLAND_DISPLAY': 'wayland-1', 'FAKE_WL': mode}), \
+                    patch.object(yakala, 'CLIP_TIMEOUT', timeout):
+                return yakala._clipboard(self._Tk())
+        self.assertEqual(read('text'), 'https://ornek.com/%C5%9F?a=1&b=2')
+        self.assertEqual(read('args'), '--no-newline|--type|text|')
+        self.assertEqual(read('latin'), 'caf\ufffd \ufffd')
+        self.assertEqual(read('empty'), 'tk panosu: Şifre')
+        self.assertEqual(read('stuck', timeout=0.5), 'tk panosu: Şifre')
 
     def test_kind_and_slug(self):
         self.assertEqual(yakala.kind_of('https://m.youtube.com/watch?v=1'), 'youtube')
