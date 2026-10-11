@@ -69,16 +69,44 @@ def latest_receipts(db, vault, sessions=None):
             yield source, event
 
 
-def recent_receipts(db, days=7, limit=20, today=None, vault=None):
+def _bound_day(bound, zone):
+    """Local calendar day of a recap bound; a date bound already is that day."""
+    return bound.astimezone(zone).date() if isinstance(bound, datetime) else bound
+
+
+def _within(bound, stamp, day, lower):
+    """One recap bound: an instant is compared with the receipt's instant, a date with its local day."""
+    if bound is None:
+        return True
+    value = stamp if isinstance(bound, datetime) else day
+    return bound <= value if lower else value <= bound
+
+
+def recent_receipts(db, days=7, limit=20, today=None, vault=None, since=None, until=None):
     """A bounded, source-linked activity view; summaries remain agent claims.
 
     With a vault, receipts whose own source file is gone are omitted, and refs that no longer
     exist or that point at private/untrusted records are withheld and only counted.
+
+    Without since/until the window is the last `days` UTC calendar days ending today. Either
+    bound replaces that window with an explicit range (#229). A date bound is a local calendar
+    day, the day receipt_day gives and daily/v3 is named by: since keeps receipts whose local
+    day is that day or later, until keeps them through the end of that day, so the same date in
+    both returns that one day. A datetime bound is an exact instant, inclusive. Days are compared
+    as dates and no midnight instant is computed, so a day with a clock change needs no special
+    case. Without since there is no lower bound and 'from' is None; without until the range ends
+    with today's local day. 'from' and 'through' stay dates: the local day of each bound.
     """
     if not 1 <= days <= 366 or not 1 <= limit <= 100:
         raise ValueError('recap days must be 1..366 and limit must be 1..100')
-    today = today or datetime.now(timezone.utc).date()
-    start = today - timedelta(days=days - 1)
+    ranged = since is not None or until is not None
+    if ranged:
+        zone = _local_zone()
+        if until is None:
+            until = today or datetime.now(timezone.utc).astimezone(zone).date()
+    else:
+        today = today or datetime.now(timezone.utc).date()
+        start = today - timedelta(days=days - 1)
     matches = []
     undated = 0
     for (payload,) in db.execute('SELECT payload FROM receipts'):
@@ -91,14 +119,24 @@ def recent_receipts(db, days=7, limit=20, today=None, vault=None):
         except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
             undated += 1
             continue
-        if not start <= stamp.date() <= today:
+        day = None
+        if ranged:
+            try:
+                day = stamp.astimezone(zone).date()
+            except (ValueError, OverflowError, OSError):
+                # No local day exists for this instant (Windows localtime rejects some); never invent one.
+                undated += 1
+                continue
+            if not (_within(since, stamp, day, True) and _within(until, stamp, day, False)):
+                continue
+        elif not start <= stamp.date() <= today:
             continue
         ident = event.get('event_id')
         if not isinstance(ident, str) or not ident or not isinstance(event.get('summary'), str):
             undated += 1
             continue
         source = 'receipts/' + hashlib.sha256(ident.encode()).hexdigest() + '.md'
-        matches.append((stamp, ident, source, event))
+        matches.append((stamp, ident, source, event, day))
     missing_sources = 0
     if vault is not None:
         # One directory listing instead of a stat per receipt; symlinked receipts are never adopted by sync.
@@ -111,11 +149,11 @@ def recent_receipts(db, days=7, limit=20, today=None, vault=None):
         missing_sources = len(matches) - len(present)
         matches = present
     matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    shown = [(stamp, source, event, [ref for ref in event.get('refs') or [] if isinstance(ref, str)]
-              if isinstance(event.get('refs'), list) else []) for stamp, _, source, event in matches[:limit]]
+    shown = [(stamp, source, event, day, [ref for ref in event.get('refs') or [] if isinstance(ref, str)]
+              if isinstance(event.get('refs'), list) else []) for stamp, _, source, event, day in matches[:limit]]
     hidden = _hidden_ref_sources(db, [ref for *_, refs in shown for ref in refs]) if vault is not None else set()
     items = []
-    for stamp, source, event, refs in shown:
+    for stamp, source, event, day, refs in shown:
         kept, private, missing = [], 0, 0
         for ref in refs:
             if ref in hidden:
@@ -125,12 +163,18 @@ def recent_receipts(db, days=7, limit=20, today=None, vault=None):
             else:
                 kept.append(ref)
         item = {'created_at': stamp.isoformat(), 'summary': event['summary'], 'source': source, 'refs': kept}
+        if day is not None:
+            item['day'] = day.isoformat()  # the local day that placed it in the range; created_at stays UTC
         if private or missing:
             item['refs_withheld'] = {'private': private, 'missing': missing}
         items.append(item)
+    if ranged:
+        window = {'from': None if since is None else _bound_day(since, zone).isoformat(),
+                  'through': _bound_day(until, zone).isoformat(), 'timezone': 'local'}
+    else:
+        window = {'from': start.isoformat(), 'through': today.isoformat(), 'timezone': 'UTC'}
     result = {
-        'status': 'ok', 'from': start.isoformat(), 'through': today.isoformat(),
-        'timezone': 'UTC', 'audience': 'internal', 'total': len(matches), 'shown': len(items),
+        'status': 'ok', **window, 'audience': 'internal', 'total': len(matches), 'shown': len(items),
         'truncated': len(matches) > limit, 'undated_omitted': undated,
         'items': items,
         'meaning': 'Agent-authored outcomes, not independently verified facts.',

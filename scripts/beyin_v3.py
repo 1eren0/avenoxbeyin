@@ -361,6 +361,47 @@ def load_skills():
     return beyin_v3_skills
 
 
+# Hours and minutes are bounded here so every supported Python accepts the same strings
+# (datetime.fromisoformat alone also takes 20260924, 2026-W39-4, a zone-less time or, on newer
+# versions, 24:00).
+RECAP_BOUND = (r"\d{4}-\d{2}-\d{2}"
+               r"(T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:\d{2}))?")
+
+
+def recap_bound(value: str):
+    """argparse type of recap --since/--until: a local calendar day or an exact instant.
+
+    YYYY-MM-DD returns a date; the projection compares it with each receipt's local day, the
+    day daily/v3 is named by. A full ISO 8601 timestamp must end in Z or a UTC offset and
+    returns that instant in UTC. A zone-less time is refused instead of guessed.
+    """
+    import re
+    from datetime import date, datetime, timezone
+    try:
+        match = re.fullmatch(RECAP_BOUND, value, re.ASCII)
+        if not match:
+            raise ValueError(value)
+        if match.group(1) is None:
+            return date.fromisoformat(value)
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+        stamp.astimezone()  # from/through report its local day; Windows cannot place every instant
+        return stamp
+    except (ValueError, OverflowError, OSError):
+        raise argparse.ArgumentTypeError(
+            "invalid date format: %r (use YYYY-MM-DD or an ISO 8601 timestamp with Z or a UTC offset, "
+            "such as 2026-09-24T18:30:00+03:00)" % value) from None
+
+
+def recap_bounds_inverted(since, until):
+    """True when --since lies after --until. Two instants compare directly; with a bare date
+    on either side both are compared as local calendar days, the unit a bare date selects."""
+    from datetime import datetime
+    if isinstance(since, datetime) and isinstance(until, datetime):
+        return since > until
+    first, last = (bound.astimezone().date() if isinstance(bound, datetime) else bound for bound in (since, until))
+    return first > last
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     root.add_argument("--vault", required=True, type=Path, help="Existing vault directory")
@@ -371,8 +412,16 @@ def parser():
     sub.add_parser("skill-sync", help="Reconcile project-local shared skills")
     sub.add_parser("doctor", help="Read local hook health and pending metadata counts")
     recap = sub.add_parser("recap", help="Read recent source-linked outcomes without a model call")
-    recap.add_argument("--days", type=int, default=7, help="Calendar days in UTC, including today (1..366)")
+    recap.add_argument("--days", type=int, help="Calendar days in UTC, including today (1..366, default 7); "
+                                                "not allowed with --since/--until")
     recap.add_argument("--limit", type=int, default=20, help="Maximum recent receipts to return (1..100)")
+    recap.add_argument("--since", type=recap_bound, metavar="DATE",
+                       help="Explicit range start: YYYY-MM-DD (local calendar day, as daily/v3 is named) or an "
+                            "ISO 8601 timestamp with Z or a UTC offset")
+    recap.add_argument("--until", type=recap_bound, metavar="DATE",
+                       help="Explicit range end, inclusive: YYYY-MM-DD covers that whole local day; without "
+                            "--since there is no lower bound")
+    recap.set_defaults(usage_error=recap.error)  # cross-flag checks in main() report with recap's own usage
     settings = sub.add_parser("preferences", help="Control automatic local checks and injected context")
     settings.add_argument("--profile", choices=("normal", "economical", "manual"))
     settings.add_argument("--auto-sync", choices=("on", "off"))
@@ -482,6 +531,12 @@ def main(argv=None, return_result=False):
             argument_parser.error("--summary or --summary-file is required in flag mode")
         if not args.ref:
             argument_parser.error("--ref is required in flag mode (at least one)")
+    if args.command == "recap":
+        # Usage errors, raised before any state is opened or synced.
+        if args.days is not None and (args.since is not None or args.until is not None):
+            args.usage_error("argument --days: not allowed with argument --since/--until")
+        if args.since is not None and args.until is not None and recap_bounds_inverted(args.since, args.until):
+            args.usage_error("argument --since: must not be after --until")
     try:
         vault = args.vault.expanduser().resolve()
         if not vault.is_dir():
@@ -806,14 +861,17 @@ def main(argv=None, return_result=False):
         elif args.command == "sync":
             result = sync.sync()
         elif args.command == "recap":
-            if not 1 <= args.days <= 366 or not 1 <= args.limit <= 100:
+            days = 7 if args.days is None else args.days
+            if not 1 <= days <= 366 or not 1 <= args.limit <= 100:
                 raise ValueError('recap days must be 1..366 and limit must be 1..100')
             refreshed = sync.sync()
             if refreshed.get('status') == 'conflict':
                 raise RuntimeError('Recap blocked: source sync conflict. Run sync to inspect sources.')
             from beyin_v3_projections import recent_receipts
             with store._connect() as db:
-                result = recent_receipts(db, days=args.days, limit=args.limit, vault=vault)
+                # Without the range flags this is exactly the call recap made before they existed.
+                bounds = {name: bound for name, bound in (('since', args.since), ('until', args.until)) if bound is not None}
+                result = recent_receipts(db, days=days, limit=args.limit, vault=vault, **bounds)
             if refreshed.get('status') == 'degraded':
                 warnings = refreshed.get('warnings', [])
                 result['partial'] = True

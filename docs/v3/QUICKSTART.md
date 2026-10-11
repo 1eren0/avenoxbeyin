@@ -100,6 +100,7 @@ python3 scripts/beyin_v3.py --vault /absolute/vault receipt --file receipt.json 
 python3 scripts/beyin_v3.py --vault /absolute/vault task-update --file patch.json
 python3 scripts/beyin_v3.py --vault /absolute/vault history demo-task
 python3 scripts/beyin_v3.py --vault /absolute/vault recap --days 7 --limit 20
+python3 scripts/beyin_v3.py --vault /absolute/vault recap --since 2026-09-24 --until 2026-09-24
 ```
 
 Retrieval JSON accepts `query`, `project`, `audience`, `statuses`, `limit`, and
@@ -130,6 +131,22 @@ command synchronizes local sources first (refreshing the generated `daily/v3/`
 views); it creates no receipt or note and calls no model. The installed `beyin.py
 recap` prints a compact terminal rendering on a terminal, or with `--human`; stored
 control characters are shown as `?`.
+
+`recap --since DATE` and `--until DATE` replace the `--days` window with an explicit
+range; `--days` cannot be combined with either. `DATE` is `YYYY-MM-DD` or a full ISO
+8601 timestamp ending in `Z` or a UTC offset (`2026-09-24T18:30:00+03:00`); a time
+without a zone is rejected rather than guessed. A bare date is a calendar day on this
+machine's clock, the day that names `daily/v3/YYYY-MM-DD.md`: a receipt belongs to the
+date its instant shows on the local clock, and that date is compared with the bound.
+No midnight is computed, so a day with a clock change needs no special handling.
+`--until 2026-09-24` runs through the end of that day, so `--since 2026-09-24 --until
+2026-09-24` returns exactly that day. A timestamp is an exact, inclusive instant.
+With only `--until` there is no lower bound and `from` is `null`; with only `--since`
+the range ends with today. In this mode `from` and `through` remain dates (the local
+day of each bound), `timezone` is `local` instead of `UTC`, and every entry carries
+`day`, its local calendar day, while `created_at` stays in UTC. A value in another
+form, `--since` after `--until`, and `--days` together with either flag are usage
+errors: exit status 2, the message on stderr, nothing on stdout.
 
 By default, `context` refreshes the local index before retrieval. `--no-sync`
 instead opens an already initialized SQLite index in read-only mode and does not

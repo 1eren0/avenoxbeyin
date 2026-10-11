@@ -80,6 +80,14 @@ model çağırmaz. Bunlar ajanın yazdığı sonuç iddialarıdır, bağımsız 
 değildir. Özel notlara giden bağlantılar gizlenir, silinmiş kaynaklar listelenmez.
 `--days` (1-366) ve `--limit` (1-100) ile aralığı ve uzunluğu değiştirebilirsin.
 
+Belirli bir tarih aralığı için `--days` yerine `--since` ve `--until` kullan:
+`python3 beyin.py recap --since 2026-09-24 --until 2026-09-24` yalnız o günü getirir.
+Yalnız tarih yazarsan (`YYYY-AA-GG`) bilgisayarının yerel günü sayılır; bu, `daily/v3/`
+dosya adlarındaki günle aynıdır ve `--until` o günün sonuna kadar kapsar. Saat de
+vereceksen sonuna `Z` ya da saat farkı ekle (`2026-09-24T18:30:00+03:00`). Yalnız
+`--until` verirsen alt sınır yoktur; yalnız `--since` verirsen aralık bugüne kadar sürer.
+`--days` bu iki seçenekle birlikte kullanılamaz.
+
 Bir şey ters giderse ajana **“beyin-doktor ile kontrol et”** de. Terminalden, vault klasöründe:
 
 ```sh

@@ -203,12 +203,14 @@ def human_result(result, command, installed_version=None):
         lines.append('Yerel kontroller model cagirmaz. Zamanlayici kurulmaz.')
         return '\n'.join(lines)
     if command == 'recap':
-        lines = ['Kaynakli etkinlik: ' + result['from'] + ' - ' + result['through'] +
-                 ' (UTC; ajan kayitlari, bagimsiz dogrulanmis olgular degil)']
+        # --since/--until select local calendar days (as daily/v3 is named); the --days window stays UTC.
+        local = result.get('timezone') == 'local'
+        lines = ['Kaynakli etkinlik: ' + (result['from'] or 'baslangic siniri yok') + ' - ' + result['through'] +
+                 (' (yerel gun; ' if local else ' (UTC; ') + 'ajan kayitlari, bagimsiz dogrulanmis olgular degil)']
         if not result['items']:
             lines.append('Bu aralikta tarihli kayit yok.')
         for item in result['items']:
-            lines.append('\n' + item['created_at'][:10] + '  ' + plain_text(item['summary']))
+            lines.append('\n' + (item.get('day') or item['created_at'][:10]) + '  ' + plain_text(item['summary']))
             lines.append('Kaynak: ' + plain_text(item['source']))
             for ref in item.get('refs', []):
                 lines.append('  - ' + plain_text(ref))
