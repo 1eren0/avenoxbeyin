@@ -296,9 +296,15 @@ class YakalaUnitTest(unittest.TestCase):
                 yakala.parse_hotkey(bad)
         self.assertEqual(yakala.windows_hotkey('ctrl+alt+b'), ('CTRL+ALT+B', 'Ctrl+Alt+B'))
         self.assertEqual(yakala.windows_hotkey('alt+shift+f2')[0], 'ALT+SHIFT+F2')
+        self.assertEqual(yakala._windows_hotkey_vk('ctrl+alt+b'), (0x4003, ord('B')))
+        self.assertEqual(yakala._windows_hotkey_vk('alt+shift+f2'), (0x4005, 0x71))
+        self.assertEqual(yakala._windows_hotkey_vk('ctrl+alt+1'), (0x4003, ord('1')))
         for bad in ('cmd+b', 'shift+b', 'ctrl+"'):
             with self.assertRaises(ValueError):
                 yakala.windows_hotkey(bad)
+        for bad in ('cmd+b', 'ctrl+alt+f25', 'ctrl+alt+#'):
+            with self.assertRaises(ValueError):
+                yakala._windows_hotkey_vk(bad)
 
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS key codes')
     def test_mac_hotkey_codes(self):
@@ -1159,14 +1165,34 @@ class YakalaInstalledTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == 'win32', 'Windows Start menu and Send To shortcuts')
     def test_windows_shortcuts(self):
         appdata = Path(self.env['APPDATA'])
+
+        def stop():  # a failed assertion must not leave the listener behind
+            with patch.dict(yakala.os.environ, {'APPDATA': self.env['APPDATA']}):
+                yakala._windows_stop_listener()
+        self.addCleanup(stop)
         installed = self.entry('kur')
         self.assertEqual(installed['kisayol'], 'Ctrl+Alt+B')
         start = appdata / 'Microsoft/Windows/Start Menu/Programs/Beyne At.lnk'
         sendto = appdata / 'Microsoft/Windows/SendTo/Beyne At.lnk'
+        # One startup entry per vault; the hash keeps another vault's `kaldir` away from it.
+        startup = appdata / ('Microsoft/Windows/Start Menu/Programs/Startup/Beyne At Dinleyici ' +
+                             yakala._windows_digest(self.vault)[:8] + '.lnk')
         self.assertTrue(start.is_file() and sendto.is_file())
+        self.assertTrue(startup.is_file())
         self.assertIsInstance(yakala.windows_context(), dict)
+        st = self.entry('durum')
+        self.assertTrue(st['kurulu'])
+        self.assertIn(st['dinleyici_calisiyor'], (True, False))
         self.entry('kaldir')
-        self.assertFalse(start.exists() or sendto.exists())
+        self.assertFalse(start.exists() or sendto.exists() or startup.exists())
+
+    def test_windows_utf8_output_without_encoding_error(self):
+        env = dict(self.env)
+        env.pop('PYTHONIOENCODING', None)
+        result = subprocess.run([sys.executable, str(self.vault / 'beyin.py'), 'yakala', 'durum'],
+                                capture_output=True, env=env, cwd=self.vault, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'tamam', result.stdout)
 
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux desktop entry and the command to bind')
     def test_linux_desktop_entry_and_hint(self):

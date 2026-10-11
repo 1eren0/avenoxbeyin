@@ -1671,7 +1671,7 @@ def saved_hotkey(state):
         return DEFAULT_HOTKEY
 
 
-# ---------------------------------------------------------------- hotkey listener (macOS)
+# ---------------------------------------------------------------- hotkey listeners (macOS & Windows)
 
 def listen_mac(vault, script, keycode=11, modifiers=0x1000 | 0x800):
     """Carbon RegisterEventHotKey: global, no Accessibility permission, standard library only."""
@@ -1720,6 +1720,175 @@ def listen_mac(vault, script, keycode=11, modifiers=0x1000 | 0x800):
     if carbon.RegisterEventHotKey(keycode, modifiers, HotKeyID(fourcc('BYKL'), 1), target, 0, byref(hotkey_ref)):
         raise SystemExit('Kisayol baska bir uygulamada kayitli; beyin.py yakala kisayol ile degistir')
     carbon.RunApplicationEventLoop()
+
+
+def _windows_hotkey_vk(spec):
+    mods, key = parse_hotkey(spec)
+    if 'cmd' in mods:
+        raise ValueError('Windows kisayolunda Win/Cmd tusu kullanilamaz; ctrl, alt ve shift kullan')
+    fs_modifiers = 0x4000  # MOD_NOREPEAT
+    if 'alt' in mods:
+        fs_modifiers |= 0x0001
+    if 'ctrl' in mods:
+        fs_modifiers |= 0x0002
+    if 'shift' in mods:
+        fs_modifiers |= 0x0004
+    key_lower = key.lower()
+    if re.fullmatch(r'f\d{1,2}', key_lower):
+        f_num = int(key_lower[1:])
+        if not (1 <= f_num <= 24):
+            raise ValueError('Gecersiz F tusu: ' + key)
+        vk = 0x70 + (f_num - 1)
+    elif re.fullmatch(r'[a-z0-9]', key_lower):
+        # ASCII only, as in windows_hotkey(): isalnum() also accepts 'ş', whose code point is no virtual key.
+        vk = ord(key.upper())
+    else:
+        raise ValueError('Windows kisayolunda yalniz harf, rakam ya da F tusu olabilir: ' + key)
+    return fs_modifiers, vk
+
+
+WIN_LISTENER = 'Beyne At Dinleyici'
+_WIN32 = None
+
+
+def _win32():
+    """(user32, kernel32) with declared prototypes.
+
+    A HANDLE is pointer-sized and the default int return type cuts it to 32 bits. The error
+    of a call is read with ctypes.get_last_error(): a later GetLastError() through ctypes may
+    already see another call's value. Private instances leave ctypes.windll as other code uses it.
+    """
+    global _WIN32
+    if _WIN32 is None:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL('user32', use_last_error=True)
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        name = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        for function, result, arguments in (
+                (kernel32.CreateMutexW, wintypes.HANDLE, [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]),
+                (kernel32.CreateEventW, wintypes.HANDLE, [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]),
+                (kernel32.OpenMutexW, wintypes.HANDLE, name), (kernel32.OpenEventW, wintypes.HANDLE, name),
+                (kernel32.SetEvent, wintypes.BOOL, [wintypes.HANDLE]),
+                (kernel32.CloseHandle, wintypes.BOOL, [wintypes.HANDLE]),
+                (user32.RegisterHotKey, wintypes.BOOL, [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]),
+                (user32.UnregisterHotKey, wintypes.BOOL, [wintypes.HWND, ctypes.c_int]),
+                (user32.MsgWaitForMultipleObjects, wintypes.DWORD,
+                 [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD, wintypes.DWORD]),
+                (user32.PeekMessageW, wintypes.BOOL,
+                 [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]),
+                (user32.AllowSetForegroundWindow, wintypes.BOOL, [wintypes.DWORD])):
+            function.restype, function.argtypes = result, arguments
+        _WIN32 = (user32, kernel32)
+    return _WIN32
+
+
+def _windows_digest(path):
+    import hashlib
+    return hashlib.sha256(str(Path(path).resolve()).encode('utf-8')).hexdigest()[:16]
+
+
+def _windows_mutex(vault):
+    """Held by this vault's listener for as long as its key is registered. Local\\ is this logon
+    session, where the hotkey lives too."""
+    return 'Local\\AvenoxBeyinYakala_' + _windows_digest(vault)
+
+
+def _windows_stop_event():
+    """Shared by every vault: one listener per logon session and Startup folder, the one that
+    folder starts. A run with its own APPDATA (the tests) cannot reach the user's listener."""
+    return 'Local\\AvenoxBeyinYakalaDur_' + _windows_digest(_windows_dirs()[2])
+
+
+def _listener_log(state, line):
+    """The listener has no console: why it left is kept next to its copy (macOS: launchd stderr)."""
+    try:
+        folder = Path(state) / 'yakala'
+        folder.mkdir(parents=True, exist_ok=True)
+        with open(folder / 'dinleyici.log', 'a', encoding='utf-8') as out:
+            out.write(now().isoformat(timespec='seconds') + ' ' + line + '\n')
+    except OSError:
+        pass
+
+
+def listen_windows(vault, script, spec=None, state=None):
+    """Win32 RegisterHotKey: global, no external dependencies, standard library ctypes only.
+
+    One listener per logon session, like the single macOS LaunchAgent. Returns 0 when it is
+    asked to stop or when this vault's listener already runs; exits 1 when the combination
+    cannot be registered. Nothing restarts the process, so a taken key is not retried in a loop.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    vault_path = Path(vault).resolve()
+    state = Path(state) if state else resolve_state(vault_path)
+    spec = spec or saved_hotkey(state)
+    modifiers, vk = _windows_hotkey_vk(spec)
+    user32, kernel32 = _win32()
+    hotkey_id = 1
+
+    def leave(reason):
+        _listener_log(state, reason)
+        raise SystemExit(reason)
+
+    def pressed():
+        try:
+            context = windows_context()
+            # Prefer the vault copy so an update reaches the window without reinstalling the listener.
+            current = vault_path / '.claude/scripts' / Path(script).name
+            target = current if current.is_file() else Path(script).resolve()
+            pythonw = Path(sys.executable).with_name('pythonw.exe')
+            exe = str(pythonw if pythonw.is_file() else sys.executable)
+            child = subprocess.Popen([exe, str(target), 'pencere', '--vault', str(vault_path),
+                                      '--baglam', json.dumps(context)],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            # The key press gave this process the right to take the foreground; pass it on, or the
+            # window can open behind the active application and the typing goes to that one.
+            user32.AllowSetForegroundWindow(child.pid)
+        except Exception:
+            pass
+
+    # The stop event is also the session lock: the process that created it is the listener.
+    ctypes.set_last_error(0)
+    stop = kernel32.CreateEventW(None, True, False, _windows_stop_event())  # manual reset, not signalled
+    error = ctypes.get_last_error()
+    if not stop:
+        leave('Kisayol dinleyicisi baslatilamadi (Windows hata %d)' % error)
+    mutex = None
+    try:
+        if error == 183:  # ERROR_ALREADY_EXISTS
+            if _windows_listener_running(vault_path):
+                return 0
+            leave('Baska bir vault icin kisayol dinleyicisi calisiyor; bu vault\'ta beyin.py yakala kur calistir')
+        if not user32.RegisterHotKey(None, hotkey_id, modifiers, vk):
+            leave('Kisayol kaydedilemedi: %s (Windows hata %d). Baska bir uygulamada kayitli olabilir; '
+                  'beyin.py yakala kisayol ile degistir' % (spec, ctypes.get_last_error()))
+        try:
+            # Created only now, so `durum` and `kur` never see a listener whose key was refused.
+            mutex = kernel32.CreateMutexW(None, False, _windows_mutex(vault_path))
+            handles = (wintypes.HANDLE * 1)(stop)
+            msg = wintypes.MSG()
+            while True:
+                # 0: the stop event. 1 (the handle count): a message waits. Anything else is an
+                # error, and GetMessageW's -1 taught the lesson: leave, never spin on it.
+                woke = user32.MsgWaitForMultipleObjects(1, handles, False, 0xFFFFFFFF, 0x04FF)  # INFINITE, QS_ALLINPUT
+                if woke == 0:
+                    return 0
+                if woke != 1:
+                    leave('Kisayol dinleyicisi beklerken hata aldi (Windows hata %d)' % ctypes.get_last_error())
+                while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+                    if msg.message == 0x0012:  # WM_QUIT
+                        return 0
+                    if msg.message == 0x0312:  # WM_HOTKEY
+                        pressed()
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
+    finally:
+        if mutex:
+            kernel32.CloseHandle(mutex)
+        kernel32.CloseHandle(stop)
 
 
 # ---------------------------------------------------------------- install / remove
@@ -1833,25 +2002,115 @@ def _agent_vault():
 
 def _windows_dirs():
     appdata = Path(os.environ.get('APPDATA', str(Path.home() / 'AppData/Roaming')))
-    return appdata / 'Microsoft/Windows/Start Menu/Programs', appdata / 'Microsoft/Windows/SendTo'
+    programs = appdata / 'Microsoft/Windows/Start Menu/Programs'
+    return programs, appdata / 'Microsoft/Windows/SendTo', programs / 'Startup'
+
+
+def _windows_listener_link(vault):
+    """This vault's entry in shell:startup. The hash in the name is the owner mark the macOS plist
+    carries in its arguments: `kaldir` and `durum` only ever look at their own vault's file."""
+    return _windows_dirs()[2] / (WIN_LISTENER + ' ' + _windows_digest(vault)[:8] + '.lnk')
+
+
+def _windows_listener_running(vault):
+    _user32, kernel32 = _win32()
+    handle = kernel32.OpenMutexW(0x00100000, False, _windows_mutex(vault))  # SYNCHRONIZE
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
+def _windows_listener_ok(vault, process, timeout=8.0):
+    """True once the listener holds this vault's mutex; False as soon as it has exited
+    (the key is taken) or when the wait runs out."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _windows_listener_running(vault):
+            return True
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+    return _windows_listener_running(vault)
+
+
+def _windows_stop_listener(vault=None, timeout=5.0):
+    """Ask the session's listener to leave through its named event.
+
+    No process id is involved, so nothing but a yakala listener can ever be stopped. With a
+    vault only that vault's listener is asked (uninstall leaves another vault's alone); without
+    one, whichever runs (`kur` moves the key to its vault, as the single LaunchAgent does).
+    """
+    import time
+    if vault is not None and not _windows_listener_running(vault):
+        return
+    _user32, kernel32 = _win32()
+    name = _windows_stop_event()
+    event = kernel32.OpenEventW(0x0002, False, name)  # EVENT_MODIFY_STATE
+    if not event:
+        return
+    kernel32.SetEvent(event)
+    kernel32.CloseHandle(event)
+    # The event lives while the listener holds it; once it is gone the next listener may start.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        event = kernel32.OpenEventW(0x00100000, False, name)  # SYNCHRONIZE
+        if not event:
+            return
+        kernel32.CloseHandle(event)
+        time.sleep(0.05)
 
 
 def _ps_quote(value):
-    return "'" + str(value).replace("'", "''") + "'"
+    # PowerShell also ends a single-quoted string at the typographic quotes (U+2018..U+201B).
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r'\1\1', str(value)) + "'"
+
+
+def _windows_link_hotkey(spec):
+    """`CTRL+ALT+B` as the number a shell link stores: virtual key low, HOTKEYF_* flags high."""
+    flags, key = 0, 0
+    for part in str(spec).upper().split('+'):
+        if part in ('SHIFT', 'CTRL', 'ALT', 'EXT'):
+            flags |= {'SHIFT': 1, 'CTRL': 2, 'ALT': 4, 'EXT': 8}[part]
+        elif len(part) == 1 and part.isascii() and part.isalnum():
+            key = ord(part)
+        elif re.fullmatch(r'F([1-9]|1[0-9]|2[0-4])', part):
+            key = 0x6F + int(part[1:])
+        else:
+            raise ValueError('Kisayol tusu taninmadi: ' + str(spec))
+    return flags << 8 | key
 
 
 def _windows_shortcut(path, target, arguments, hotkey=None):
+    """Write a .lnk through the shell's own link object, which keeps every character.
+
+    WScript.Shell turns each string into the ANSI code page first: on a cp1252 system a vault under
+    `Şifre 📥` was stored as `Sifre ??`, so the entry started a path that does not exist, and a link
+    whose own path had such a letter could not be saved at all (measured on the Windows runners).
+    """
     import base64
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    lines = ['$s = (New-Object -ComObject WScript.Shell).CreateShortcut(' + _ps_quote(path) + ')',
-             '$s.TargetPath = ' + _ps_quote(target), '$s.Arguments = ' + _ps_quote(arguments),
-             '$s.Description = ' + _ps_quote('Beyne at: ikinci beyne kaynak yakala'), '$s.WindowStyle = 7']
-    if hotkey:
-        lines.append('$s.Hotkey = ' + _ps_quote(hotkey))
-    lines.append('$s.Save()')
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The link object loads what the file holds: start from an empty file, so a property this call
+    # no longer sets (3.9.0 stored the key in the Start menu entry) cannot survive the rewrite.
+    path.write_bytes(b'')
+    lines = ["$ErrorActionPreference = 'Stop'",
+             '$l = (New-Object -ComObject Shell.Application).NameSpace(' + _ps_quote(path.parent) + ').ParseName(' +
+             _ps_quote(path.name) + ').GetLink',
+             '$l.Path = ' + _ps_quote(target), '$l.Arguments = ' + _ps_quote(arguments),
+             '$l.Description = ' + _ps_quote('Beyne at: ikinci beyne kaynak yakala'), '$l.ShowCommand = 7']
+    if hotkey:  # only to rebuild what 3.9.0 left; `kur` gives the key to the listener instead
+        lines.append('$l.Hotkey = ' + str(_windows_link_hotkey(hotkey)))
+    lines.append('$l.Save()')
     encoded = base64.b64encode('\n'.join(lines).encode('utf-16le')).decode('ascii')
-    subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                   check=True, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    try:
+        subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                       check=True, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        if path.is_file() and not path.stat().st_size:
+            path.unlink()  # an empty .lnk in Startup or Send To is an error dialog waiting to happen
+        raise
 
 
 def _argline(values):
@@ -2076,10 +2335,26 @@ def install(vault, state, hotkey=True, spec=None, folder_spec=None):
     elif hotkey and os.name == 'nt':
         pythonw = Path(sys.executable).with_name('pythonw.exe')
         target = pythonw if pythonw.is_file() else Path(sys.executable)
-        programs, sendto = _windows_dirs()
-        _windows_shortcut(programs / 'Beyne At.lnk', target, _argline([script, 'pencere', '--vault', vault]), win_value)
+        programs, sendto, startup = _windows_dirs()
+        # No .Hotkey on the Start menu entry: the listener owns the combination. One combination has
+        # one owner, so with both either Explorer or the listener would fail after the next logon.
+        _windows_shortcut(programs / 'Beyne At.lnk', target, _argline([script, 'pencere', '--vault', vault]))
         _windows_shortcut(sendto / 'Beyne At.lnk', target, _argline([script, 'ekle', '--vault', vault, '--arac', 'gonder-menusu']))
+        # One listener per logon session, like the single LaunchAgent: the key moves to this vault.
+        _windows_stop_listener()
+        for other in startup.glob(WIN_LISTENER + '*.lnk'):
+            other.unlink()
+        runner = state / 'yakala' / script.name
+        runner.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(script, runner)
+        command = [str(part) for part in (runner, 'dinle', '--vault', vault, '--tus', spec)]
+        _windows_shortcut(_windows_listener_link(vault), target, _argline(command))
+        # Null handles and a folder of its own: the listener outlives this command, and a process
+        # that kept the caller's pipes or stood inside the vault would block both (no rename, no move).
+        listener = subprocess.Popen([str(target)] + command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, cwd=str(runner.parent), creationflags=NO_WINDOW)
         done.update(kisayol=label, gonder_menusu=True)
+        done['kisayol_calisiyor'] = _windows_listener_ok(vault, listener)
     state.mkdir(parents=True, exist_ok=True)
     _state_path(state).write_text(json.dumps({'schema': 1, 'session_notice': True, 'kisayol': done['kisayol'],
                                               'tus': spec if done['kisayol'] else saved_hotkey(state),
@@ -2113,8 +2388,13 @@ def uninstall(vault, state):
                 _gnome_set_list([p for p in paths if p != GNOME_PATH])
             _try(['gsettings', 'reset-recursively', _gnome_schema()])
     elif os.name == 'nt':
-        for folder in _windows_dirs():
-            link = folder / 'Beyne At.lnk'
+        # Only this vault's listener and startup entry. When another vault's entry is there instead,
+        # its `kur` rewrote the Start menu and Send To shortcuts too: they are no longer this vault's.
+        _windows_stop_listener(vault)
+        programs, sendto, startup = _windows_dirs()
+        own = _windows_listener_link(vault)
+        moved = not own.exists() and any(startup.glob(WIN_LISTENER + '*.lnk'))
+        for link in ([] if moved else [programs / 'Beyne At.lnk', sendto / 'Beyne At.lnk']) + [own]:
             if link.exists():
                 link.unlink()
                 removed.append(str(link.name))
@@ -2145,6 +2425,9 @@ def status(vault, state):
     running = None
     if sys.platform == 'darwin' and _agent_vault() == str(Path(vault).resolve()):
         running = _listener_ok(wait=0)
+    elif os.name == 'nt' and _windows_listener_link(vault).exists():
+        # None without this vault's startup entry: a 3.9.0 install or --kisayol-yok has no listener.
+        running = _windows_listener_running(vault)
     elif sys.platform.startswith('linux') and _desktop_owner(_desktop_file()) == str(Path(vault).resolve()):
         desktop = _linux_desktop()
         if desktop == 'kde':
@@ -2235,6 +2518,27 @@ def human(result, command):
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+def _json_text(result, stream):
+    """JSON for `stream`: readable where it already writes UTF-8, ASCII escapes everywhere else.
+
+    macOS and Linux keep the literal characters 3.9.0 printed (a Turkish title, the inbox emoji).
+    A piped Windows console is cp1254 or cp1252, where the emoji cannot be encoded at all, and
+    ASCII means the same under whatever decoder the reader uses (#268). The stream decides, not
+    the platform: its encoding name is normalized (utf-8, utf8, UTF8, cp65001), and a detached
+    or closed stream, or one without a usable name, gets ASCII.
+    """
+    import codecs
+    try:
+        # .closed raises on a detached stream, which still reports the encoding it once had.
+        if not stream.closed and codecs.lookup(stream.encoding).name == 'utf-8':
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+            text.encode('utf-8')  # a lone surrogate (an undecodable file name) still needs the escapes
+            return text
+    except (AttributeError, LookupError, TypeError, ValueError):
+        pass
+    return json.dumps(result, ensure_ascii=True, indent=2)
+
+
 def main(argv=None, vault=None, state=None):
     def shared(default):
         # Subcommands must not reset a --vault/--json given before them, hence SUPPRESS there.
@@ -2260,6 +2564,7 @@ def main(argv=None, vault=None, state=None):
     listen = command_parser('dinle', help=argparse.SUPPRESS)
     listen.add_argument('--keycode', type=int, default=11)
     listen.add_argument('--mods', type=int, default=0x1000 | 0x800)
+    listen.add_argument('--tus')
     run = command_parser('isle', help='Bekleyen kaynaklarin metnini cikar (ag kullanir)')
     run.add_argument('ids', nargs='*')
     run.add_argument('--ses-yok', action='store_true', help='Altyazi yoksa sesi indirme')
@@ -2293,8 +2598,12 @@ def main(argv=None, vault=None, state=None):
         context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
         result = popup(vault, context, state)
     elif command == 'dinle':
-        listen_mac(vault, Path(__file__).resolve(), args.keycode, args.mods)
-        return 0
+        if sys.platform == 'darwin':
+            listen_mac(vault, Path(__file__).resolve(), args.keycode, args.mods)
+            return 0
+        elif os.name == 'nt':
+            return listen_windows(vault, Path(__file__).resolve(), args.tus, state)
+        raise ValueError('Bu isletim sisteminde kisayol dinleyicisi desteklenmiyor')
     elif command == 'ekle':
         url, files, texts = None, [], []
         for item in args.items:
@@ -2330,7 +2639,15 @@ def main(argv=None, vault=None, state=None):
         result = clipper_template(find_inbox(vault, state))
     if sys.stdout is None:
         return 0
-    print(json.dumps(result, ensure_ascii=False, indent=2) if as_json or command == 'sablon' else human(result, command))
+    if as_json or command == 'sablon':
+        # Keep the stream check: literal characters only for a UTF-8 stream, ASCII escapes for a
+        # legacy code page, where printing them raw fails the command after it did its work (#268).
+        print(_json_text(result, sys.stdout))
+        return 0
+    if hasattr(sys.stdout, 'reconfigure'):
+        # Text for a person: a character the terminal cannot show prints as '?', as in beyin.py.
+        sys.stdout.reconfigure(errors='replace')
+    print(human(result, command))
     return 0
 
 

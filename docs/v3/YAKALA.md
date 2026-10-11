@@ -23,7 +23,7 @@ Kurulum şunları yapar:
 | Ajan | `beyin-yakala` skill'i | `beyin-yakala` skill'i |
 
 Kısayol ek paket istemez; Python'un kendisiyle çalışır. Mac'te bir oturum açılış servisi
-(LaunchAgent) tuşu dinler, Windows'ta Başlat menüsündeki kısayol tuşu kullanılır.
+(LaunchAgent), Windows'ta oturum açılışında başlayan küçük bir dinleyici tuşu dinler.
 Yalnız şablon ve skill istiyorsan: `python3 beyin.py yakala kur --kisayol-yok`.
 
 ### Linux
@@ -89,7 +89,7 @@ python3 beyin.py yakala kisayol 'cmd+"'
 
 Tuşu yazdığın gibi tarif et: `cmd`, `ctrl`, `alt` (ya da `option`), `shift` ve en sonda tuş.
 Örnekler: `ctrl+alt+b` (varsayılan), `cmd+shift+space`, `alt+f5`, `⌘⇧K`. Mac'te karakter etkin klavye
-düzeninden bulunur; Türkçe Q'da `"` 1'in solundaki tuştur. Windows'ta Başlat menüsü kısayolu
+düzeninden bulunur; Türkçe Q'da `"` 1'in solundaki tuştur. Windows'ta kısayol
 yalnız Ctrl/Alt/Shift ile harf, rakam ya da F tuşunu kabul eder. Argümansız `kisayol` mevcut tuşu
 gösterir. Seçtiğin tuşu başka bir uygulama zaten kullanıyorsa komut uyarır; başka bir tuş dene.
 
@@ -106,6 +106,17 @@ Dinleyici `kur`'un yazdığı bir kopyadan çalışır: bir güncellemeden sonra
 3. Bir sayfada eklentiye bas, "Beyne at" şablonunu seç, istersen **Neden** bölümüne bir satır yaz, ekle.
 
 Web Clipper sayfayı tarayıcının içinden okur; giriş isteyen sayfalar (Gmail, ücretli makale) da böylece yakalanır.
+
+### Windows: kısayol dinleyicisi
+
+`kur`, Başlangıç klasörüne (`shell:startup`) bir `Beyne At Dinleyici` kısayolu yazar ve dinleyiciyi
+hemen başlatır; oturumu kapatıp açmak gerekmez. Bir oturumda tek dinleyici çalışır: `kur`u başka bir
+vault'ta çalıştırırsan tuş o vault'a geçer. Durumu `py -3 beyin.py yakala durum` söyler; dinleyici
+başlayamadıysa nedeni state klasöründeki `yakala/dinleyici.log` dosyasına yazılır.
+
+3.9.0 ile kurduysan `py -3 beyin.py yakala kur` komutunu bir kez daha çalıştır: eski kurulum tuşu
+Başlat menüsü kısayoluna yazıyordu, yenisi dinleyiciye verir. O oturumda "dinleyici başlamadı"
+uyarısı görürsen oturumu kapatıp aç; Windows eski kısayolu oturum boyunca tutabiliyor.
 
 ## Kullanım
 
