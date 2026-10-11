@@ -4,7 +4,7 @@ Three layers. The output tests set the console's encoding with PYTHONIOENCODING 
 every OS. The flow tests drive the listener against an in-memory model of the few Win32
 calls it makes, so its rules (one listener per logon session, stop by name, status only after
 the key is registered) hold everywhere. The Windows-only tests call the real API: RegisterHotKey,
-the named mutex and event, and shortcuts written through WScript.Shell. They skip, with a line
+the named mutex and event, and shortcuts written through the shell's link object. They skip, with a line
 on stderr, when the session cannot register a hotkey at all (no interactive desktop).
 """
 import base64
@@ -567,6 +567,49 @@ class InstallFlowTest(unittest.TestCase):
         self.assertEqual(yakala.uninstall(vault, state)['kaldirilan'], ['Beyne At.lnk', 'Beyne At.lnk', 'yakala.json'])
 
 
+class ShortcutWriterTest(unittest.TestCase):
+    """The shortcut is written through the shell's link object; these parts run on every system."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-lnk-')
+        self.addCleanup(self.tmp.cleanup)
+        self.link = Path(self.tmp.name) / 'kısayollar' / 'Beyne At.lnk'
+
+    def script(self, run):
+        encoded = run.call_args.args[0][-1]
+        return base64.b64decode(encoded).decode('utf-16le')
+
+    def test_the_link_object_that_keeps_unicode_writes_the_file(self):
+        with patch.object(yakala.subprocess, 'run') as run:
+            yakala._windows_shortcut(self.link, 'pythonw.exe', 'dinle --vault "Şifre\'nin ’ 📥 kasası"')
+        text = self.script(run)
+        self.assertIn('Shell.Application', text)
+        self.assertNotIn('WScript.Shell', text)  # it stores Ş as S and an emoji as ??
+        self.assertIn("$ErrorActionPreference = 'Stop'", text)
+        self.assertIn("'dinle --vault \"Şifre\'\'nin ’’ 📥 kasası\"'", text)
+        self.assertNotIn('.Hotkey', text)
+        self.assertEqual(self.link.read_bytes(), b'')  # the object fills the empty file it was given
+
+    def test_an_old_key_is_written_as_the_number_a_link_stores(self):
+        self.assertEqual(yakala._windows_link_hotkey('CTRL+ALT+B'), 0x0600 | ord('B'))
+        self.assertEqual(yakala._windows_link_hotkey('Alt+Ctrl+b'), 0x0600 | ord('B'))
+        self.assertEqual(yakala._windows_link_hotkey('CTRL+ALT+SHIFT+F8'), 0x0700 | 0x77)
+        self.assertEqual(yakala._windows_link_hotkey('ctrl+shift+7'), 0x0300 | ord('7'))
+        for bad in ('CTRL+ALT+Ş', 'CTRL+ALT+F25', 'CTRL+ALT+BB'):
+            with self.assertRaises(ValueError):
+                yakala._windows_link_hotkey(bad)
+        with patch.object(yakala.subprocess, 'run') as run:
+            yakala._windows_shortcut(self.link, 'pythonw.exe', 'pencere', hotkey='CTRL+ALT+B')
+        self.assertIn('$l.Hotkey = ' + str(0x0642), self.script(run))
+
+    def test_a_failed_write_leaves_no_empty_link_behind(self):
+        failure = subprocess.CalledProcessError(1, ['powershell.exe'])
+        with patch.object(yakala.subprocess, 'run', side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError):
+                yakala._windows_shortcut(self.link, 'pythonw.exe', 'pencere')
+        self.assertFalse(self.link.exists())
+
+
 def powershell(script):
     encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
     result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
@@ -576,10 +619,15 @@ def powershell(script):
 
 
 def read_shortcut(link, scratch):
-    """TargetPath, Arguments and Hotkey as Windows itself reads them back from the file."""
-    out = Path(scratch) / 'shortcut.json'
-    powershell('$s = (New-Object -ComObject WScript.Shell).CreateShortcut(' + yakala._ps_quote(link) + ')\n'
-               '$o = @{ target = $s.TargetPath; arguments = $s.Arguments; hotkey = $s.Hotkey }\n'
+    """Target, arguments and hotkey as the shell reads them back from the file, character for character.
+
+    Through Shell.Application, not WScript.Shell: that one answers in the ANSI code page too.
+    """
+    out, link = Path(scratch) / 'shortcut.json', Path(link)
+    powershell("$ErrorActionPreference = 'Stop'\n"
+               '$l = (New-Object -ComObject Shell.Application).NameSpace(' + yakala._ps_quote(link.parent) + ').ParseName(' +
+               yakala._ps_quote(link.name) + ').GetLink\n'
+               '$o = @{ target = $l.Path; arguments = $l.Arguments; hotkey = [int]$l.Hotkey }\n'
                '[IO.File]::WriteAllText(' + yakala._ps_quote(out) + ', (ConvertTo-Json $o), (New-Object Text.UTF8Encoding $false))')
     return json.loads(out.read_text(encoding='utf-8'))
 
@@ -623,7 +671,7 @@ def try_hotkey(spec):
     return True, 0
 
 
-@unittest.skipUnless(WINDOWS, 'real Win32: RegisterHotKey, named mutex and event, WScript.Shell shortcuts')
+@unittest.skipUnless(WINDOWS, 'real Win32: RegisterHotKey, named mutex and event, shell link shortcuts')
 class WindowsListenerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-win-', ignore_cleanup_errors=True)
@@ -739,7 +787,7 @@ class WindowsListenerTest(unittest.TestCase):
         self.assertEqual(split_arguments(written['arguments']), command)
         self.assertTrue(written['hotkey'])  # a 3.9.0 Start menu entry carried the key like this
         yakala._windows_shortcut(link, sys.executable, yakala._argline(command))
-        self.assertEqual(read_shortcut(link, self.root)['hotkey'], '')
+        self.assertEqual(read_shortcut(link, self.root)['hotkey'], 0)
 
 
 @unittest.skipUnless(WINDOWS, 'real Win32: `kur`, `durum` and `kaldir` with the listener')
@@ -790,7 +838,7 @@ class WindowsInstalledTest(unittest.TestCase):
                              '); listener start not asserted\n')
         self.assertTrue(link.is_file())
         self.assertEqual([path.exists() for path in stale], [False, False])  # the key moved to this vault
-        self.assertEqual(read_shortcut(start, self.root)['hotkey'], '')  # the listener owns the key now
+        self.assertEqual(read_shortcut(start, self.root)['hotkey'], 0)  # the listener owns the key now
         written = read_shortcut(link, self.root)
         runner = self.state.resolve() / 'yakala' / MODULE.name
         self.assertEqual(split_arguments(written['arguments']),
