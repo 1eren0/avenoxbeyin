@@ -3,6 +3,7 @@ must be retirable through one named path instead of a blanket override."""
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -277,6 +278,42 @@ class InstallLegacyExemptionTest(unittest.TestCase):
         self.assertEqual(sentinel.read_bytes(), record)
         self.assertEqual(snapshot(self.vault), before)
         self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def lock_directory(self, days):
+        """What a V2 prompt-counter hook killed between its mkdir and its rmdir leaves behind."""
+        path = self.vault / '.claude/scripts/.state' / ('prompt_count.' + 'a' * 64 + '.lock')
+        path.mkdir(parents=True)
+        stamp = time.time() - days * 86400
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_install_stops_on_a_young_prompt_counter_lock_directory_with_a_clear_error(self):
+        lock = self.lock_directory(days=0)
+        before = snapshot(self.vault)
+        result = self.cli()
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, b'')
+        error = json.loads(result.stderr)
+        self.assertEqual(error['error'], 'RuntimeError')
+        self.assertRegex(error['message'], r'legacy writer lock directory in \.claude/scripts/\.state/prompt_count\.a{64}\.lock'
+                                           r' is less than 8 days old.*so rerun\..*remove that empty directory and rerun')
+        self.assertNotIn(str(self.base), error['message'])
+        self.assertTrue(lock.is_dir())
+        self.assertEqual(snapshot(self.vault), before)
+        self.assertFalse((self.vault / '.beyin-version').exists())
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def test_install_reports_a_lock_directory_v2_itself_would_sweep(self):
+        lock = self.lock_directory(days=9)
+        stamp = lock.lstat().st_mtime_ns
+        result = self.cli()
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
+        stale = [lock.relative_to(self.vault).as_posix()]
+        self.assertEqual(json.loads(result.stdout)['stale_legacy_locks'], stale)
+        receipt = json.loads((self.state / 'v2-migration.json').read_text(encoding='utf-8'))
+        self.assertEqual(receipt['stale_legacy_locks'], stale)
+        self.assertTrue(lock.is_dir())
+        self.assertEqual(lock.lstat().st_mtime_ns, stamp)
 
     def test_keeping_one_runner_does_not_exempt_another(self):
         self.seed('.claude/scripts/flush.py', CUSTOM_RUNNER)

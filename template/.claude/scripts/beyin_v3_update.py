@@ -478,12 +478,14 @@ def update(vault, state, package=None, check=False):
         # but nothing else would ever tell the user that session's summary is missing. Sentinels
         # the cutover receipt already lists were reported by that install and never change again
         # once the flush is retired, so repeating them here would follow every update forever.
-        if migration and migration[1].get('orphaned_legacy_state'):
-            receipt = migration[1].get('previous')
-            reported = set(receipt.get('orphaned_legacy_state') or []) if isinstance(receipt, dict) else set()
-            later = [name for name in migration[1]['orphaned_legacy_state'] if name not in reported]
-            if later:
-                result['orphaned_legacy_state'] = later
+        # The same goes for a prompt-counter lock directory the guard read as stale.
+        for key in ('orphaned_legacy_state', 'stale_legacy_locks'):
+            if migration and migration[1].get(key):
+                receipt = migration[1].get('previous')
+                reported = set(receipt.get(key) or []) if isinstance(receipt, dict) else set()
+                later = [name for name in migration[1][key] if name not in reported]
+                if later:
+                    result[key] = later
         return result
 
 

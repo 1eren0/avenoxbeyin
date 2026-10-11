@@ -31,10 +31,27 @@ never reached `daily/`. The same holds on every later `update` for a flush kept
 with `--keep-customized-legacy`; the `update` result lists, and its message
 counts, the sentinels that the cutover receipt does not already name.
 
+The V2 prompt counter locks differently: `prompt_count.<key>.lock` is a directory
+it creates, holds for some milliseconds and removes. A hook killed in between
+leaves the directory behind; no V2 hook ever steals it, and V2's own
+session-start sweep removes it only once it is empty and eight days old. The
+guard reads that same rule: such a directory does not block, is left where it
+is, and is listed as `stale_legacy_locks` in the same places as
+`orphaned_legacy_state`.
+
 Everything else still blocks:
 
 - A flush sentinel whose lock is free but whose `ts` is missing or less than 60
   minutes old: rerun once it is older, or reconcile it.
+- A `prompt_count.<key>.lock` directory less than eight days old: a live prompt
+  counter is gone on the next run, so rerun. If it is still there and no V2
+  session is running, it is a leftover: remove that empty directory yourself
+  and rerun.
+- A `*.lock` entry that is neither a regular file nor such a directory (another
+  directory, a non-empty one, a symlink, a FIFO), or a lock, a writer record or
+  the state directory itself that this user may not read: the error names the
+  path. Fix its permissions, or move a foreign entry out of
+  `.claude/scripts/.state`, and rerun.
 - A flush sentinel without a `flush-<key>.lock` of the same name, a `pending` or
   `running` state, or a record of another writer (`compile-state.json`,
   `antigravity-<key>.json`): a free lock proves nothing about these, and the
@@ -211,8 +228,9 @@ covers a session.
 
 Synthetic tests cover byte preservation, idempotent watermarking, inflight
 rejection, lock-proven orphaned sentinels (one test drives the stock V2 flush
-itself on POSIX), concurrent source-edit detection, private Companion filtering,
-new-only outcome projections, manual-view conflicts, note-create refusal to
-overwrite, and receipt-gap closure. Actual V2 workers, external schedules and
-client trust still require environment-specific validation. A green migration
-unit test is not evidence that every external worker has stopped.
+itself on POSIX), stale and fresh prompt-counter lock directories, unreadable
+lock and state entries, concurrent source-edit detection, private Companion
+filtering, new-only outcome projections, manual-view conflicts, note-create
+refusal to overwrite, and receipt-gap closure. Actual V2 workers, external
+schedules and client trust still require environment-specific validation. A
+green migration unit test is not evidence that every external worker has stopped.

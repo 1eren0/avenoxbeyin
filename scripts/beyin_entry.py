@@ -420,6 +420,9 @@ def human_result(result, command, installed_version=None):
             message += ('\nYarida kesilmis ' + str(len(result['orphaned_legacy_state'])) + ' V2 flush kaydi var (durumu inflight,'
                         ' yazan surec artik calismiyor); engel sayilmadi, dosyalara dokunulmadi.'
                         ' O oturumlarin ozeti daily/ altina yazilmamis olabilir.')
+        if result.get('stale_legacy_locks'):
+            message += ('\nSahipsiz kalmis ' + str(len(result['stale_legacy_locks'])) + ' V2 kilit klasoru var (prompt_count.*.lock,'
+                        ' sekiz gunden eski); engel sayilmadi, dokunulmadi.')
     elif status == 'available':
         message = 'Yeni surum var: ' + str(result.get('current_version', '?')) + ' -> ' + str(result['version']) + '\nGuncellemek icin: python beyin.py update'
     elif status == 'noop':

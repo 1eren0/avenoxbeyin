@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -36,6 +37,14 @@ class MigrationTest(unittest.TestCase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(text.encode('utf-8'))
         return p
+
+    def lock_directory(self, name='prompt_count.' + 'a' * 64 + '.lock', days=0):
+        """The directory V2's prompt counter makes with mkdir and normally removes again."""
+        path = self.root / '.claude/scripts/.state' / name
+        path.mkdir(parents=True)
+        stamp = time.time() - days * 86400
+        os.utime(path, (stamp, stamp))
+        return path
 
     def test_sources_and_v2_state_preserved_idempotent_cutover(self):
         paths = [self.source('daily/2025-01-01.md', 'Human day\r\n'),
@@ -206,6 +215,128 @@ class MigrationTest(unittest.TestCase):
         with self.m.migration_guard(self.root, self.state) as plan:
             self.assertEqual(plan['orphaned_legacy_state'], ['.claude/scripts/.state/flush-later.json'])
             self.assertEqual(self.m.finalize_migration(self.root, self.state, plan), first)
+
+    def test_prompt_counter_lock_directory_v2_itself_would_sweep_does_not_block(self):
+        # A prompt-counter hook killed between its mkdir and its rmdir leaves this directory. No
+        # V2 hook steals it; V2's own session-start sweep removes it once it is empty and eight
+        # days old. The guard reads that rule and leaves the directory alone.
+        lock = self.lock_directory(days=9)
+        stamp = lock.lstat().st_mtime_ns
+        relative = lock.relative_to(self.root).as_posix()
+        result = self.m.migrate_v2(self.root, self.state)
+        self.assertEqual(result['stale_legacy_locks'], [relative])
+        self.assertEqual(json.loads((self.state / 'v2-migration.json').read_text(encoding='utf-8'))['stale_legacy_locks'], [relative])
+        self.assertTrue(lock.is_dir())
+        self.assertEqual(list(lock.iterdir()), [])
+        self.assertEqual(lock.lstat().st_mtime_ns, stamp)
+        self.assertNotIn(relative, result['legacy_state'])
+
+    def test_lock_directory_at_eight_days_is_stale(self):
+        lock = self.lock_directory(days=self.m.STALE_LOCK_DIRECTORY_SECONDS / 86400)
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['stale_legacy_locks'], [lock.relative_to(self.root).as_posix()])
+
+    def test_younger_prompt_counter_lock_directory_blocks_and_says_what_to_do(self):
+        # Seconds old may be a live hook; 7.5 days old is one V2's own sweep would still keep.
+        for days in (0, 7.5, -1):
+            with self.subTest(days=days):
+                lock = self.lock_directory(days=days)
+                with self.assertRaisesRegex(RuntimeError, r'legacy writer lock directory in \.claude/scripts/\.state/prompt_count\.a{64}\.lock'
+                                                          r' is less than 8 days old.*so rerun\..*no V2 session is running.*'
+                                                          r'remove that empty directory and rerun') as raised:
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertNotIn(self.temp.name, str(raised.exception))
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+                self.assertTrue(lock.is_dir())
+                lock.rmdir()
+
+    def test_lock_directory_v2_would_never_sweep_blocks_however_old(self):
+        # rmdir refuses a directory with something in it, and the sweep only knows the prompt
+        # counter's name: neither is a lock the guard can read as released.
+        for name, inside in (('prompt_count.' + 'a' * 64 + '.lock', 'note.txt'), ('compile.lock', None), ('flush-example.lock', None)):
+            with self.subTest(name=name):
+                lock = self.lock_directory(name)
+                if inside:
+                    (lock / inside).write_bytes(b'synthetic')
+                stamp = time.time() - 30 * 86400
+                os.utime(lock, (stamp, stamp))
+                with self.assertRaisesRegex(RuntimeError, r'legacy writer lock in \.claude/scripts/\.state/' + re.escape(name) +
+                                                          r' is a directory that is not an empty V2 prompt-counter lock;'
+                                                          r' review it locally and move it out of the V2 state directory'):
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+                self.assertTrue(lock.is_dir())
+                if inside:
+                    (lock / inside).unlink()
+                lock.rmdir()
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs a FIFO')
+    def test_lock_that_is_not_a_regular_file_blocks_without_being_opened(self):
+        fifo = self.root / '.claude/scripts/.state/flush-example.lock'
+        fifo.parent.mkdir(parents=True)
+        os.mkfifo(fifo)
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer lock in \.claude/scripts/\.state/flush-example\.lock'
+                                                  r' is not a regular file; review it locally and move it out'):
+            self.m.migrate_v2(self.root, self.state)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    def test_lock_symlink_is_refused_with_its_path(self):
+        target = self.source('.claude/scripts/.state/elsewhere.txt', '')
+        try:
+            target.with_name('flush-example.lock').symlink_to(target)
+        except OSError:
+            self.skipTest('symlink unavailable')
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer lock in \.claude/scripts/\.state/flush-example\.lock is a symlink; review it locally'):
+            self.m.migrate_v2(self.root, self.state)
+
+    def test_lock_that_cannot_be_opened_blocks_with_its_path(self):
+        if hasattr(os, 'geteuid') and os.geteuid() == 0:
+            self.skipTest('root opens a file whatever its mode')
+        lock = self.source('.claude/scripts/.state/flush-example.lock', '')
+        lock.chmod(0o444)  # no write bit on POSIX, the read-only attribute on Windows: r+b fails on both
+        self.addCleanup(lock.chmod, 0o644)
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer lock in \.claude/scripts/\.state/flush-example\.lock cannot be opened'
+                                                  r' \(.+\); make it readable and writable for this user, then rerun') as raised:
+            self.m.migrate_v2(self.root, self.state)
+        self.assertNotIn(self.temp.name, str(raised.exception))
+        self.assertFalse((self.state / 'v2-migration.json').exists())
+
+    @unittest.skipUnless(os.name == 'posix', 'directory permission bits')
+    def test_state_directory_that_cannot_be_read_blocks_instead_of_passing_unseen(self):
+        if os.geteuid() == 0:
+            self.skipTest('root reads a directory whatever its mode')
+        # A listing that fails used to look like an empty directory: the writer inside went
+        # unseen and the cutover recorded no legacy state at all.
+        sentinel = self.source('.claude/scripts/.state/flush-example.json', flush_record(age=0))
+        self.source('.claude/scripts/.state/flush-example.lock', '')
+        legacy = sentinel.parent
+        self.addCleanup(legacy.chmod, 0o755)
+        for mode in (0o000, 0o311, 0o444):
+            with self.subTest(mode=oct(mode)):
+                legacy.chmod(mode)
+                with self.assertRaisesRegex(RuntimeError, r'legacy writer state directory \.claude/scripts/\.state cannot be read;'
+                                                          r' make it readable for this user, then rerun'):
+                    self.m.migrate_v2(self.root, self.state)
+                self.assertFalse((self.state / 'v2-migration.json').exists())
+        # Reading is all the guard needs: a read-only state directory is not an obstacle.
+        legacy.chmod(0o755)
+        sentinel.write_bytes(flush_record().encode('utf-8'))
+        legacy.chmod(0o555)
+        with self.m.migration_guard(self.root, self.state) as plan:
+            self.assertEqual(plan['orphaned_legacy_state'], ['.claude/scripts/.state/flush-example.json'])
+
+    def test_writer_record_that_cannot_be_read_blocks_with_its_path(self):
+        record = self.root / '.claude/scripts/.state/flush-example.json'
+        record.mkdir(parents=True)  # reading it fails on every platform
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer state in \.claude/scripts/\.state/flush-example\.json cannot be read'
+                                                  r' \(.+\); make it a readable file for this user') as raised:
+            self.m.migrate_v2(self.root, self.state)
+        self.assertNotIn(self.temp.name, str(raised.exception))
+        record.rmdir()
+        record.write_bytes(b'{"status": "infl')
+        with self.assertRaisesRegex(RuntimeError, r'legacy writer state unreadable in \.claude/scripts/\.state/flush-example\.json; review locally'):
+            self.m.migrate_v2(self.root, self.state)
+        self.assertFalse((self.state / 'v2-migration.json').exists())
 
     def test_legacy_lock_is_guarded_but_excluded_from_inventory(self):
         lock = self.source('.claude/scripts/.state/compile.lock', '')
