@@ -319,7 +319,9 @@ def enqueue_event(vault, state, payload, harness):
     key = hashlib.sha256(identity.encode()).hexdigest()
     path = state / "hook-queue" / (key + ".json")
     if not path.exists() and not (state / "hook-done" / (key + ".json")).exists():
-        atomic(path, dict(metadata, at=time.time()))
+        from beyin_v3_hook_done import acknowledged
+        if not acknowledged(state, key):
+            atomic(path, dict(metadata, at=time.time()))
     return key
 
 
@@ -370,6 +372,13 @@ def drain_queue(vault, state):
                 except FileNotFoundError:
                     continue  # Another worker already atomically acknowledged this event.
                 processed += 1
+        # Compaction is best effort and runs only after durable acknowledgement.
+        # A failure leaves old JSONs in place and cannot turn a successful sync into a retry.
+        try:
+            from beyin_v3_hook_done import prune
+            prune(engine.store)
+        except Exception:
+            pass
         return {"processed": processed, "failed": 0, "pending": len(list((state / "hook-queue").glob("*.json")))}
     return {"processed": 0, "failed": len(pending), "pending": len(pending)}
 
