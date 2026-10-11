@@ -1936,22 +1936,50 @@ def _ps_quote(value):
     return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r'\1\1', str(value)) + "'"
 
 
+def _windows_link_hotkey(spec):
+    """`CTRL+ALT+B` as the number a shell link stores: virtual key low, HOTKEYF_* flags high."""
+    flags, key = 0, 0
+    for part in str(spec).upper().split('+'):
+        if part in ('SHIFT', 'CTRL', 'ALT', 'EXT'):
+            flags |= {'SHIFT': 1, 'CTRL': 2, 'ALT': 4, 'EXT': 8}[part]
+        elif len(part) == 1 and part.isascii() and part.isalnum():
+            key = ord(part)
+        elif re.fullmatch(r'F([1-9]|1[0-9]|2[0-4])', part):
+            key = 0x6F + int(part[1:])
+        else:
+            raise ValueError('Kisayol tusu taninmadi: ' + str(spec))
+    return flags << 8 | key
+
+
 def _windows_shortcut(path, target, arguments, hotkey=None):
+    """Write a .lnk through the shell's own link object, which keeps every character.
+
+    WScript.Shell turns each string into the ANSI code page first: on a cp1252 system a vault under
+    `Şifre 📥` was stored as `Sifre ??`, so the entry started a path that does not exist, and a link
+    whose own path had such a letter could not be saved at all (measured on the Windows runners).
+    """
     import base64
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    if Path(path).exists():
-        # CreateShortcut loads an existing file: start empty, so a property this call no longer
-        # sets (3.9.0 stored the key in the Start menu entry's .Hotkey) cannot survive the rewrite.
-        Path(path).unlink()
-    lines = ['$s = (New-Object -ComObject WScript.Shell).CreateShortcut(' + _ps_quote(path) + ')',
-             '$s.TargetPath = ' + _ps_quote(target), '$s.Arguments = ' + _ps_quote(arguments),
-             '$s.Description = ' + _ps_quote('Beyne at: ikinci beyne kaynak yakala'), '$s.WindowStyle = 7']
-    if hotkey:
-        lines.append('$s.Hotkey = ' + _ps_quote(hotkey))
-    lines.append('$s.Save()')
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The link object loads what the file holds: start from an empty file, so a property this call
+    # no longer sets (3.9.0 stored the key in the Start menu entry) cannot survive the rewrite.
+    path.write_bytes(b'')
+    lines = ["$ErrorActionPreference = 'Stop'",
+             '$l = (New-Object -ComObject Shell.Application).NameSpace(' + _ps_quote(path.parent) + ').ParseName(' +
+             _ps_quote(path.name) + ').GetLink',
+             '$l.Path = ' + _ps_quote(target), '$l.Arguments = ' + _ps_quote(arguments),
+             '$l.Description = ' + _ps_quote('Beyne at: ikinci beyne kaynak yakala'), '$l.ShowCommand = 7']
+    if hotkey:  # only to rebuild what 3.9.0 left; `kur` gives the key to the listener instead
+        lines.append('$l.Hotkey = ' + str(_windows_link_hotkey(hotkey)))
+    lines.append('$l.Save()')
     encoded = base64.b64encode('\n'.join(lines).encode('utf-16le')).decode('ascii')
-    subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                   check=True, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    try:
+        subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                       check=True, capture_output=True, timeout=60, creationflags=NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        if path.is_file() and not path.stat().st_size:
+            path.unlink()  # an empty .lnk in Startup or Send To is an error dialog waiting to happen
+        raise
 
 
 def _argline(values):
