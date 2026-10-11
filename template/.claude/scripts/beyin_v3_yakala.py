@@ -893,6 +893,286 @@ def _fit(canvas, text, font, width):
     return text.rstrip() + '…'
 
 
+# Clipboard image (#274), Windows only for now. After Win+Shift+S the clipboard holds the picture and a
+# file-drop entry for a temp file that Windows deletes later. Tk hands that entry to clipboard_get() as
+# text, so the popup saved the path and lost the picture. Pure helpers first, then the reader and the card.
+
+IMAGE_FRESH = 600  # seconds; only a screenshot younger than this starts switched on, the rest waits for Tab
+IMAGE_LIMIT = 64 * 1024 * 1024  # bytes taken from the clipboard; two 4K screens side by side fit as a bitmap
+PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
+# The reported path is ...\AppData\Local\Packages\<app>\TempState\ScreenClip\{GUID}.png. Any picture under a
+# packaged app's TempState counts, so the folder below it is not relied on.
+SNIP_TEMP = re.compile(r'[a-z]:/(?:[^/\r\n]+/)*packages/[^/\r\n]+/tempstate/(?:[^/\r\n]+/)*[^/\r\n]+\.(?:png|jpe?g|bmp|gif)', re.I)
+
+
+def png_info(data):
+    """(width, height, end offset) of a complete PNG at the start of `data`, else None. Every CRC is checked."""
+    import zlib
+    view = memoryview(data)
+    if bytes(view[:8]) != PNG_MAGIC:
+        return None
+    position, size, pixels = 8, None, False
+    while position + 12 <= len(view):
+        end = position + 12 + int.from_bytes(view[position:position + 4], 'big')
+        kind = bytes(view[position + 4:position + 8])
+        if end > len(view) or zlib.crc32(view[position + 4:end - 4]) != int.from_bytes(view[end - 4:end], 'big'):
+            return None
+        if size is None:
+            if kind != b'IHDR' or end - position != 25:
+                return None
+            size = (int.from_bytes(view[position + 8:position + 12], 'big'), int.from_bytes(view[position + 12:position + 16], 'big'))
+            if not (0 < size[0] < 2 ** 31 and 0 < size[1] < 2 ** 31):
+                return None
+        elif kind == b'IDAT':
+            pixels = True
+        elif kind == b'IEND':
+            return (size[0], size[1], end) if pixels else None
+        position = end
+    return None
+
+
+def _png_chunk(kind, body):
+    import zlib
+    return len(body).to_bytes(4, 'big') + kind + body + zlib.crc32(body, zlib.crc32(kind)).to_bytes(4, 'big')
+
+
+def dib_to_png(data, level=2):
+    """Packed DIB (CF_DIB: header, optional masks and colour table, pixels) -> (PNG bytes, width, height).
+
+    Covers what screens and screenshot tools produce: 24 and 32 bits per pixel, BI_RGB and byte-aligned
+    BI_BITFIELDS, bottom-up and top-down rows, padded rows. The PNG is always opaque: the fourth byte of a
+    32-bit DIB is unused far more often than it is alpha (all zero after a screen grab), and a source that
+    means transparency also offers a real PNG, which is taken first. None for any other layout.
+    """
+    import struct
+    import zlib
+    if len(data) < 40:
+        return None
+    header, width, height, _planes, bits, compression = struct.unpack_from('<IiiHHI', data, 0)
+    used = struct.unpack_from('<I', data, 32)[0]
+    rows = abs(height)
+    if not (40 <= header <= len(data) and 0 < width <= 65535 and 0 < rows <= 65535 and bits in (24, 32) and used <= 256):
+        return None
+    step, start, stride = bits // 8, header + used * 4, (width * bits + 31) // 32 * 4
+    red, green, blue = 2, 1, 0  # BI_RGB pixels are stored blue, green, red
+    if compression == 3:  # BI_BITFIELDS: three masks after a 40-byte header, inside a V4/V5 one
+        if bits != 32 or 40 < header < 52 or len(data) < 52:
+            return None
+        masks = struct.unpack_from('<III', data, 40)
+        order = [{0xFF: 0, 0xFF00: 1, 0xFF0000: 2, 0xFF000000: 3}.get(mask) for mask in masks]
+        if None in order or len(set(order)) != 3:
+            return None
+        red, green, blue = order
+        if header == 40 or (data[header:header + 12] == data[40:52] and len(data) >= start + 12 + stride * rows):
+            start += 12  # some writers repeat the masks after a V4/V5 header
+    elif compression != 0:
+        return None
+    if len(data) < start + stride * rows:
+        return None
+    line = bytearray(1 + width * 3)  # filter type 0, then red, green, blue
+    packer = zlib.compressobj(level)
+    packed = []
+    for index in range(rows):
+        at = start + (index if height < 0 else rows - 1 - index) * stride
+        row = data[at:at + width * step]
+        line[1::3], line[2::3], line[3::3] = row[red::step], row[green::step], row[blue::step]
+        packed.append(packer.compress(line))
+    packed.append(packer.flush())
+    head = struct.pack('>IIBBBBB', width, rows, 8, 2, 0, 0, 0)
+    return PNG_MAGIC + _png_chunk(b'IHDR', head) + _png_chunk(b'IDAT', b''.join(packed)) + _png_chunk(b'IEND', b''), width, rows
+
+
+def snip_path(text):
+    """The Snipping Tool's temp picture when `text` is nothing but its path (either slash, optional quotes), else None."""
+    text = str(text or '').strip().strip('"')
+    return text if SNIP_TEMP.fullmatch(text.replace('\\', '/')) else None
+
+
+def _win_clipboard_payload(limit=IMAGE_LIMIT, tries=6):
+    """Raw image bytes on the Windows clipboard: {'image': bool, 'png': bytes or None, 'dib': bytes or None}.
+
+    None when the clipboard cannot be opened (another process holds it). Handles and pointers are declared
+    for 64-bit, each payload is copied out under its own lock, and the clipboard is closed before anything
+    is converted or written; a PNG is only checked first, to know whether the bitmap is needed at all.
+    CF_DIB is asked for instead of CF_DIBV5: Windows builds it from whichever bitmap format the source
+    gave, and its header has no V5 mask-offset ambiguity.
+    """
+    import ctypes
+    import time
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.WinDLL('user32'), ctypes.WinDLL('kernel32')  # private copies: prototypes stay local
+    user32.OpenClipboard.argtypes, user32.OpenClipboard.restype = [wintypes.HWND], wintypes.BOOL
+    user32.CloseClipboard.argtypes, user32.CloseClipboard.restype = [], wintypes.BOOL
+    user32.IsClipboardFormatAvailable.argtypes, user32.IsClipboardFormatAvailable.restype = [wintypes.UINT], wintypes.BOOL
+    user32.RegisterClipboardFormatW.argtypes, user32.RegisterClipboardFormatW.restype = [wintypes.LPCWSTR], wintypes.UINT
+    user32.GetClipboardData.argtypes, user32.GetClipboardData.restype = [wintypes.UINT], wintypes.HANDLE
+    kernel32.GlobalSize.argtypes, kernel32.GlobalSize.restype = [wintypes.HGLOBAL], ctypes.c_size_t
+    kernel32.GlobalLock.argtypes, kernel32.GlobalLock.restype = [wintypes.HGLOBAL], wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes, kernel32.GlobalUnlock.restype = [wintypes.HGLOBAL], wintypes.BOOL
+    for attempt in range(tries):
+        if user32.OpenClipboard(None):
+            break
+        if attempt + 1 < tries:
+            time.sleep(0.02 * (attempt + 1))
+    else:
+        return None
+    found = {'image': False, 'png': None, 'dib': None}
+
+    def take(code):
+        if not code or not user32.IsClipboardFormatAvailable(code):
+            return None
+        found['image'] = True
+        handle = user32.GetClipboardData(code)
+        size = kernel32.GlobalSize(handle) if handle else 0
+        pointer = kernel32.GlobalLock(handle) if 0 < size <= limit else None
+        if not pointer:
+            return None
+        try:
+            return ctypes.string_at(pointer, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    try:
+        for name in ('PNG', 'image/png'):  # what the Snipping Tool, browsers and Office put next to the bitmap
+            found['png'] = found['png'] or take(user32.RegisterClipboardFormatW(name))
+        if not (found['png'] and png_info(found['png'])):
+            found['dib'] = take(8)  # CF_DIB
+    finally:
+        user32.CloseClipboard()
+    return found
+
+
+def _clipboard_payload():
+    """Raw image bytes on the system clipboard. Only Windows has a reader; everywhere else nothing changes."""
+    return _win_clipboard_payload() if os.name == 'nt' else None
+
+
+def clipboard_image(clip, context, at=None):
+    """The image on the clipboard as a temp PNG the popup shows and can attach, or None to change nothing.
+
+    Offered only when nothing else would be saved: no page, file or text from the context, and the
+    clipboard text is empty or just the screenshot's own temp path. Real text or a link stays the capture
+    exactly as before. Only a provably fresh screenshot starts switched on: its temp file is still there
+    and younger than IMAGE_FRESH. Every other picture is shown and waits for Tab. Failure returns None.
+    """
+    import time
+    folder = None
+    try:
+        own = snip_path(clip)
+        if context.get('url') or context.get('dosyalar') or context.get('metin') or (str(clip or '').strip() and not own):
+            return None
+        payload = _clipboard_payload()
+        if not payload or not payload.get('image'):
+            return None
+        png = size = None
+        info = png_info(payload['png']) if payload.get('png') else None
+        if info:
+            png, size = bytes(payload['png'][:info[2]]), info[:2]
+        elif payload.get('dib'):
+            made = dib_to_png(payload['dib'])
+            if made:
+                png, size = made[0], made[1:]
+        if png is None and own and os.path.isfile(own) and os.path.getsize(own) <= IMAGE_LIMIT:
+            raw = Path(own).read_bytes()  # a bitmap this reader cannot convert: the screenshot's file is the same picture
+            info = png_info(raw)
+            if info:
+                png, size = raw[:info[2]], info[:2]
+        if png is None:
+            return None
+        at = time.time() if at is None else at
+        try:
+            age = max(0.0, at - os.path.getmtime(own)) if own else None
+        except OSError:
+            age = None  # Windows already deleted the temp file: not a screenshot from a moment ago
+        fresh = age is not None and age <= IMAGE_FRESH  # an agent reads what is saved: no proof, no attachment
+        folder = tempfile.mkdtemp(prefix='beyin-yakala-')
+        path = Path(folder) / ('pano-goruntusu-' + datetime.fromtimestamp(at).strftime('%Y%m%d-%H%M%S') + '.png')
+        path.write_bytes(png)
+        return {'path': str(path), 'folder': folder, 'width': size[0], 'height': size[1], 'age': age, 'stale': bool(own) and not fresh, 'on': fresh}
+    except Exception:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+        return None
+
+
+def _ago(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return 'az önce'
+    if minutes < 60:
+        return str(minutes) + ' dk önce'
+    return str(minutes // 60) + ' saat önce' if minutes < 2880 else str(minutes // 1440) + ' gün önce'
+
+
+def image_lines(image, on):
+    """Headline and detail line of the clipboard image card for the current switch state."""
+    facts = ['%d×%d' % (image['width'], image['height'])]
+    if image['age'] is not None:
+        facts.append(_ago(image['age']))
+    elif image['stale']:
+        facts.append('eski, geçici dosyası silinmiş')
+    facts.append('Tab ile çıkar' if on else 'Tab ile ekle')
+    return 'Panodaki görüntü' if on else 'Panodaki görüntü eklenmeyecek', ' · '.join(facts)
+
+
+def _image_thumb(root, image, box=(112, 54)):
+    """Small Tk copy of the picture so an old screenshot is recognised at a glance; None when Tk cannot read it."""
+    if image['width'] * image['height'] > 24_000_000:
+        return None
+    try:
+        import tkinter as tk
+        full = tk.PhotoImage(master=root, file=image['path'])
+        factor = max(1, -(-full.width() // box[0]), -(-full.height() // box[1]))
+        return full.subsample(factor) if factor > 1 else full
+    except Exception:
+        return None
+
+
+def _image_card(canvas, root, image, y, width, pad, changed):
+    """Preview card for the clipboard image; Tab or a click switches it. Calls changed(on), returns the next y."""
+    import tkinter.font as tkfont
+    P, height, state = PALETTE, 78, {'on': bool(image['on'])}
+    items = [_round_rect(canvas, pad, y, width - pad, y + height, 14, fill=P['card'], outline=P['card_line'])]
+    right = width - pad - 16
+    thumb = _image_thumb(root, image)
+    if thumb is not None:
+        image['thumb'] = thumb  # Tk drops a picture nothing refers to
+        items.append(canvas.create_image(right, y + height / 2, image=thumb, anchor='e'))
+        right -= thumb.width() + 14
+    chip_font = _font(10, 'bold')
+    chip_w = tkfont.Font(root=root, font=chip_font).measure('GÖRSEL') + 18
+    chip_y, text_x = y + 28, pad + 16 + chip_w + 12
+    chip = _round_rect(canvas, pad + 16, chip_y - 11, pad + 16 + chip_w, chip_y + 11, 8, fill=P['accent'], outline='')
+    label = canvas.create_text(pad + 16 + chip_w / 2, chip_y, text='GÖRSEL', fill=P['accent_text'], font=chip_font)
+    headline = canvas.create_text(text_x, chip_y, anchor='w', fill=P['text'], font=_font(14, 'bold'))
+    detail = canvas.create_text(pad + 16, y + height - 20, anchor='w', fill=P['muted'], font=_font(12))
+
+    def draw():
+        on = state['on']
+        first, second = image_lines(image, on)
+        canvas.itemconfigure(chip, fill=P['accent'] if on else P['key'], outline='' if on else P['key_line'])
+        canvas.itemconfigure(label, fill=P['accent_text'] if on else P['muted'])
+        canvas.itemconfigure(headline, text=_fit(canvas, first, _font(14, 'bold'), right - text_x), fill=P['text'] if on else P['muted'])
+        canvas.itemconfigure(detail, text=_fit(canvas, second, _font(12), right - pad - 16))
+        changed(on)
+
+    def toggle(_event=None):
+        state['on'] = not state['on']
+        draw()
+        return 'break'
+    for item in items + [chip, label, headline, detail]:
+        canvas.tag_bind(item, '<Button-1>', toggle)
+    root.bind('<Tab>', toggle)
+    draw()
+    return y + height + 12
+
+
+def _image_done(image):
+    """The vault has its own copy by now (or the user closed the window): drop the temp file."""
+    if image:
+        image.pop('thumb', None)
+        shutil.rmtree(image['folder'], ignore_errors=True)
+
+
 def repair_mojibake(text):
     """UTF-8 bytes that a tool decoded as Mac Roman or cp1252 ('pahalƒ±' for 'pahalı'); else unchanged."""
     if not text or text.isascii():
@@ -969,6 +1249,9 @@ def popup(vault, context=None, state=None):
     root = tk.Tk()
     root.withdraw()
     clip = _clipboard(root).strip()
+    image = clipboard_image(clip, context)  # Windows: a picture on the clipboard (#274); None changes nothing
+    if image:
+        clip = ''  # at most the screenshot's own temp path, which is not the note
     clip_is_url = bool(re.match(r'^https?://\S+$', clip))
     url = context.get('url') or (clip if clip_is_url else None)
     files = context.get('dosyalar') or []
@@ -1080,6 +1363,16 @@ def popup(vault, context=None, state=None):
         root.bind('<Tab>', toggle)
         y += 30
 
+    # Clipboard image (#274): shown before it is attached; Tab or a click takes it off or puts it back.
+    if image:
+        def image_changed(on):
+            nonlocal placeholder_text
+            files[:] = [image['path']] if on else []
+            placeholder_text = 'Neden kaydediyorsun?' if on else 'Aklındakini yaz…'
+            if hint['on']:
+                show_hint()
+        y = _image_card(canvas, root, image, y, W, pad, image_changed)
+
     # Footer: status on the left, key hints on the right.
     y += 8
     footer_y = y + 14
@@ -1172,6 +1465,7 @@ def popup(vault, context=None, state=None):
             root.destroy()
         root.after(700, shoot)
     root.mainloop()
+    _image_done(image)
     return result or {'status': 'vazgecildi'}
 
 

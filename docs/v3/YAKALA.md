@@ -112,6 +112,14 @@ Web Clipper sayfayı tarayıcının içinden okur; giriş isteyen sayfalar (Gmai
 1. **Yakala.** Kısayola bas. Pencere neyin kaydedileceğini gösterir: tarayıcıdaki sayfa
    (Mac'te Chrome, Arc, Brave, Edge, Safari), Finder'da seçili dosya ya da panodaki metin.
    İstersen tek satır "neden" yaz, Enter. Esc vazgeçer.
+
+   Windows'ta panoda görüntü varsa pencere onu küçük önizlemesiyle gösterir. Az önce alınmış bir
+   ekran görüntüsü (`Win+Shift+S`, son 10 dakika) eklenmeye hazır gelir: Enter onu kartların
+   yanındaki `dosyalar/` klasörüne PNG olarak kaydeder ve Gönder > Beyne At ile aynı dosya kartını
+   açar. Başka her görüntü (daha eski bir ekran görüntüsü, tarayıcıdan kopyalanan resim) gösterilir
+   ama kapalı gelir, yani ilgisiz bir görüntü yazdığın nota kendiliğinden karışmaz; eklemek için
+   `Tab`'a bas ya da karta tıkla, aynı tuş açık görüntüyü çıkarır. Panoda metin ya da bağlantı
+   varsa eskisi gibi o yakalanır.
 2. **İşlet.** Ajanına "yakalananları işle" de. Oturum başında bekleyen kaynak sayısı da görünür.
 
 Her yakalama kart klasöründe (varsayılan `📥 000-Inbox/Yakala/`) bir kart olur. Aynı videoyu ya da

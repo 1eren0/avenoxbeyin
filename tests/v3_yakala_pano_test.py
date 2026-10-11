@@ -1,0 +1,920 @@
+"""Clipboard image for the capture popup (#274): Windows screenshots become a file card, not a path note.
+
+The conversion and the decision are plain functions, tested on every OS with synthetic bitmaps and a
+strict PNG reader. The popup wiring runs against a scripted stand-in for tkinter, so no window opens.
+The real Windows clipboard is exercised only on a Windows CI runner (or with BEYIN_TEST_PANO=1),
+because those tests replace whatever the clipboard holds.
+"""
+import os
+from pathlib import Path
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import unittest
+from unittest.mock import patch
+import zlib
+
+from v3_package_helpers import inherited_env
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / 'template/.claude/scripts'
+INBOX = '📥 000-Inbox/Yakala'
+sys.path.insert(0, str(SCRIPTS))
+import beyin_v3_yakala as yakala  # noqa: E402
+
+BYTE_OF = {0xFF: 0, 0xFF00: 1, 0xFF0000: 2, 0xFF000000: 3}
+REPORTED = ('C:/Users/Özdemir/AppData/Local/Packages/MicrosoftWindows.Client.Core_cw5n1h2txyewy/'
+            'TempState/ScreenClip/{4F1C2A6E-0B7D-4C55-9E21-7A3D5B8C9F10}.png')
+
+
+def picture(width, height):
+    """Top-down rows of distinct (red, green, blue) pixels."""
+    return [[((10 + 40 * x + y) % 256, (20 + 3 * x + 50 * y) % 256, (200 - 7 * x - 11 * y) % 256) for x in range(width)]
+            for y in range(height)]
+
+
+def make_dib(pixels, bits=24, top_down=False, compression=0, masks=None, header=40, table=0, fourth=0,
+             repeat_masks=False, slack=0):
+    """Packed DIB as CF_DIB carries it; padding bytes are 0xEE so a reader that touches them shows up."""
+    height, width, step = len(pixels), len(pixels[0]), bits // 8
+    red, green, blue = [BYTE_OF[mask] for mask in masks] if masks else (2, 1, 0)
+    stride = (width * bits + 31) // 32 * 4
+    lines = []
+    for row in pixels:
+        line = bytearray(b'\xee' * stride)
+        for x, (r, g, b) in enumerate(row):
+            if step == 4:
+                line[x * 4:x * 4 + 4] = bytes([fourth(x) if callable(fourth) else fourth]) * 4
+            line[x * step + red], line[x * step + green], line[x * step + blue] = r, g, b
+        lines.append(bytes(line))
+    if not top_down:
+        lines.reverse()
+    head = bytearray(struct.pack('<IiiHHIIiiII', header, width, -height if top_down else height, 1, bits,
+                                 compression, stride * height, 2835, 2835, table, 0) + bytes(header - 40))
+    if masks and header == 40:
+        head += struct.pack('<III', *masks)
+    elif masks:
+        head[40:52] = struct.pack('<III', *masks)
+        if repeat_masks:
+            head += struct.pack('<III', *masks)
+    return bytes(head) + b'\x11' * (table * 4) + b''.join(lines) + bytes(slack)
+
+
+def decode_png(data):
+    """Strict reader for the PNGs under test: 8-bit RGB or RGBA, unfiltered rows, every CRC verified."""
+    assert data[:8] == b'\x89PNG\r\n\x1a\n', data[:8]
+    position, chunks = 8, []
+    while position < len(data):
+        length = struct.unpack('>I', data[position:position + 4])[0]
+        kind, body = data[position + 4:position + 8], data[position + 8:position + 8 + length]
+        assert zlib.crc32(kind + body) == struct.unpack('>I', data[position + 8 + length:position + 12 + length])[0], kind
+        chunks.append((kind, body))
+        position += 12 + length
+    assert position == len(data) and chunks[0][0] == b'IHDR' and chunks[-1] == (b'IEND', b''), [kind for kind, _ in chunks]
+    width, height, depth, colour, compression, filtering, interlace = struct.unpack('>IIBBBBB', chunks[0][1])
+    assert (depth, compression, filtering, interlace) == (8, 0, 0, 0) and colour in (2, 6), chunks[0][1]
+    channels = 3 if colour == 2 else 4
+    raw = zlib.decompress(b''.join(body for kind, body in chunks if kind == b'IDAT'))
+    stride = width * channels + 1
+    assert len(raw) == height * stride, (len(raw), height, stride)
+    rows = []
+    for index in range(height):
+        line = raw[index * stride:(index + 1) * stride]
+        assert line[0] == 0, 'filtered row'
+        rows.append([tuple(line[1 + at:1 + at + channels]) for at in range(0, width * channels, channels)])
+    return width, height, channels, rows
+
+
+def make_png(pixels, alpha=200):
+    """An RGBA PNG written by the test itself: the kind of payload another app puts on the clipboard."""
+    def chunk(kind, body):
+        return struct.pack('>I', len(body)) + kind + body + struct.pack('>I', zlib.crc32(kind + body))
+    raw = b''.join(b'\x00' + b''.join(bytes(pixel) + bytes([alpha]) for pixel in row) for row in pixels)
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', len(pixels[0]), len(pixels), 8, 6, 0, 0, 0))
+            + chunk(b'tEXt', b'Software\x00test') + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+
+
+class BitmapToPngTest(unittest.TestCase):
+    def convert(self, pixels, **options):
+        made = yakala.dib_to_png(make_dib(pixels, **options))
+        self.assertIsNotNone(made, options)
+        png, width, height = made
+        decoded = decode_png(png)
+        self.assertEqual(decoded[:3], (width, height, 3))
+        self.assertEqual((width, height), (len(pixels[0]), len(pixels)))
+        self.assertEqual(yakala.png_info(png), (width, height, len(png)))
+        return decoded[3]
+
+    def test_24_bit_bottom_up_with_row_padding(self):
+        for width in (1, 2, 3, 4, 5):  # strides 4, 8, 12, 12, 16: one to three padding bytes, or none
+            pixels = picture(width, 3)
+            self.assertEqual(self.convert(pixels), pixels, width)
+
+    def test_24_bit_top_down(self):
+        pixels = picture(5, 4)
+        self.assertEqual(self.convert(pixels, top_down=True), pixels)
+
+    def test_32_bit_rgb_is_opaque_whatever_the_fourth_byte_holds(self):
+        pixels = picture(4, 3)
+        for fourth in (0, 255, lambda x: (0, 77, 255, 1)[x]):  # all zero after a screen grab; garbage elsewhere
+            for top_down in (False, True):
+                self.assertEqual(self.convert(pixels, bits=32, top_down=top_down, fourth=fourth), pixels)
+
+    def test_32_bit_bitfields_in_any_byte_order(self):
+        pixels = picture(3, 2)
+        bgr, rgb, shifted = (0xFF0000, 0xFF00, 0xFF), (0xFF, 0xFF00, 0xFF0000), (0xFF000000, 0xFF0000, 0xFF00)
+        for masks in (bgr, rgb, shifted):
+            self.assertEqual(self.convert(pixels, bits=32, compression=3, masks=masks), pixels, masks)
+            self.assertEqual(self.convert(pixels, bits=32, compression=3, masks=masks, top_down=True), pixels, masks)
+
+    def test_v4_and_v5_headers_keep_masks_inside_and_tolerate_a_repeated_copy(self):
+        pixels = picture(3, 2)
+        masks = (0xFF0000, 0xFF00, 0xFF)
+        for header in (108, 124):
+            self.assertEqual(self.convert(pixels, bits=32, header=header), pixels)
+            self.assertEqual(self.convert(pixels, bits=32, header=header, compression=3, masks=masks), pixels)
+            self.assertEqual(self.convert(pixels, bits=32, header=header, compression=3, masks=masks, repeat_masks=True), pixels)
+
+    def test_colour_table_and_allocation_slack_are_skipped(self):
+        pixels = picture(3, 3)
+        self.assertEqual(self.convert(pixels, table=2), pixels)
+        self.assertEqual(self.convert(pixels, bits=32, table=3, slack=13), pixels)  # GlobalSize rounds up
+
+    def test_other_layouts_are_refused_not_guessed(self):
+        pixels = picture(3, 2)
+        good = make_dib(pixels)
+        self.assertIsNotNone(yakala.dib_to_png(good))
+        refused = {
+            'empty': b'', 'short header': good[:39], 'missing rows': good[:-1],
+            'core header': struct.pack('<IHHHH', 12, 3, 2, 1, 24) + bytes(64),
+            '8 bit': good[:14] + struct.pack('<H', 8) + good[16:],
+            '16 bit': good[:14] + struct.pack('<H', 16) + good[16:],
+            'rle': good[:16] + struct.pack('<I', 1) + good[20:],
+            'png inside': good[:16] + struct.pack('<I', 5) + good[20:],
+            'zero width': good[:4] + struct.pack('<i', 0) + good[8:],
+            'zero height': good[:8] + struct.pack('<i', 0) + good[12:],
+            'negative width': good[:4] + struct.pack('<i', -3) + good[8:],
+            'huge width': good[:4] + struct.pack('<i', 70000) + good[8:],
+            'bitfields at 24 bit': good[:16] + struct.pack('<I', 3) + good[20:],
+            'ten bit masks': make_dib(pixels, bits=32, compression=3, masks=(0xFF0000, 0xFF00, 0xFF))[:40]
+                             + struct.pack('<III', 0x3FF00000, 0xFFC00, 0x3FF) + bytes(64),
+            'same mask twice': make_dib(pixels, bits=32, compression=3, masks=(0xFF0000, 0xFF00, 0xFF))[:40]
+                               + struct.pack('<III', 0xFF, 0xFF, 0xFF00) + bytes(64),
+        }
+        for name, data in refused.items():
+            self.assertIsNone(yakala.dib_to_png(data), name)
+
+    def test_png_info_checks_structure_and_every_crc(self):
+        pixels = picture(4, 2)
+        png = make_png(pixels)
+        self.assertEqual(yakala.png_info(png), (4, 2, len(png)))
+        self.assertEqual(yakala.png_info(png + bytes(40)), (4, 2, len(png)))  # allocation slack after IEND
+        self.assertEqual(yakala.png_info(bytearray(png)), (4, 2, len(png)))
+        flipped = bytearray(png)
+        flipped[len(png) // 2] ^= 1
+        without_pixels = png[:33] + png[-12:]
+        for name, data in {'empty': b'', 'bitmap': make_dib(pixels), 'cut': png[:-5], 'no end': png[:-12],
+                           'flipped bit': bytes(flipped), 'no pixels': without_pixels, 'jpeg': b'\xff\xd8\xff\xe0' + bytes(64)}.items():
+            self.assertIsNone(yakala.png_info(data), name)
+
+
+class SnipPathTest(unittest.TestCase):
+    def test_only_a_packaged_app_temp_picture_path_matches(self):
+        back = REPORTED.replace('/', '\\')
+        packages = 'd:/Users/a/AppData/Local/Packages/'
+        for text in (REPORTED, back, '"' + back + '"', '  ' + REPORTED + '\n', REPORTED.upper(),
+                     packages + 'MicrosoftWindows.Client.CBS_cw5n1h2txyewy/TempState/ScreenClip/x.PNG',
+                     packages + 'Microsoft.ScreenSketch_8wekyb3d8bbwe/TempState/Ekran görüntüsü 2026-10-11.jpg'):
+            self.assertEqual(yakala.snip_path(text), text.strip().strip('"'), text)
+        for text in ('', None, 'not', 'https://ornek.com/Packages/a/TempState/ScreenClip/a.png', 'C:/Users/a/Pictures/Screenshots/a.png',
+                     'C:/Users/a/Desktop/ScreenClip/a.png', 'C:/Users/a/TempState/a.png', packages + 'Uygulama_x/LocalState/a.png',
+                     REPORTED + '\n' + REPORTED, 'bak: ' + REPORTED, REPORTED + ' buna bak', REPORTED[:-4] + '.json',
+                     REPORTED.replace('C:/', '/mnt/c/'), REPORTED + '\nC:/Users/a/not.png'):
+            self.assertIsNone(yakala.snip_path(text), text)
+
+
+class ScreenshotFiles:
+    """A folder laid out like the Snipping Tool's temp store, on whatever system runs the test."""
+
+    def make_store(self, prefix):
+        self.tmp = tempfile.TemporaryDirectory(prefix=prefix)
+        self.addCleanup(self.tmp.cleanup)
+        if os.name != 'nt':  # a temp path here has no drive letter; the rest of the pattern stays as shipped
+            relaxed = patch.object(yakala, 'SNIP_TEMP', re.compile(
+                r'(?:[a-z]:)?/(?:[^/\r\n]+/)*packages/[^/\r\n]+/tempstate/(?:[^/\r\n]+/)*[^/\r\n]+\.png', re.I), create=True)
+            relaxed.start()
+            self.addCleanup(relaxed.stop)
+
+    def shot_file(self, age=None, content=None, now=None):
+        """Path of a temp screenshot `age` seconds old (as Tk reports it); the file is absent when age is None."""
+        path = Path(self.tmp.name) / 'Packages' / 'Ornek.Uygulama_abc' / 'TempState' / 'ScreenClip' / '{0A1B}.png'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if age is not None:
+            now = time.time() if now is None else now
+            path.write_bytes(make_png(self.pixels) if content is None else content)
+            os.utime(path, (now - age, now - age))
+        return path.as_posix()
+
+
+class ImageOfferTest(ScreenshotFiles, unittest.TestCase):
+    """clipboard_image(): what the popup may offer, decided from the text Tk read and the raw payload."""
+
+    def setUp(self):
+        self.make_store('v3-yakala-pano-')
+        self.pixels = picture(6, 4)
+        self.now = 1_800_000_000.0
+
+    def shot_file(self, age=None, content=None):
+        return super().shot_file(age, content, self.now)
+
+    def offer(self, clip, payload, context=None):
+        with patch.object(yakala, '_clipboard_payload', return_value=payload) as probe:
+            image = yakala.clipboard_image(clip, context or {}, at=self.now)
+        if image:
+            self.addCleanup(yakala._image_done, image)
+        return image, probe
+
+    def test_picture_without_a_temp_file_is_offered_switched_off(self):
+        # A copied web image or an old PrtScn has no age: an agent reads what is saved, so the user decides.
+        image, _ = self.offer('', {'image': True, 'png': None, 'dib': make_dib(self.pixels, bits=32)})
+        self.assertEqual((image['width'], image['height'], image['age'], image['stale'], image['on']), (6, 4, None, False, False))
+        path = Path(image['path'])
+        self.assertRegex(path.name, r'^pano-goruntusu-\d{8}-\d{6}\.png$')
+        self.assertEqual(decode_png(path.read_bytes())[3], self.pixels)
+        self.assertEqual(yakala.image_lines(image, True), ('Panodaki görüntü', '6×4 · Tab ile çıkar'))
+        self.assertEqual(yakala.image_lines(image, False), ('Panodaki görüntü eklenmeyecek', '6×4 · Tab ile ekle'))
+
+    def test_png_payload_is_stored_byte_for_byte_and_wins_over_the_bitmap(self):
+        png = make_png(self.pixels)
+        other = make_dib(picture(2, 2))
+        image, _ = self.offer('', {'image': True, 'png': png + bytes(24), 'dib': other})
+        self.assertEqual(Path(image['path']).read_bytes(), png)
+        self.assertEqual((image['width'], image['height']), (6, 4))
+        broken, _ = self.offer('', {'image': True, 'png': png[:-3], 'dib': other})
+        self.assertEqual(decode_png(Path(broken['path']).read_bytes())[3], picture(2, 2))
+
+    def test_fresh_screenshot_drops_its_own_path_and_stays_on(self):
+        clip = self.shot_file(age=95)
+        image, _ = self.offer(clip, {'image': True, 'png': None, 'dib': make_dib(self.pixels)})
+        self.assertEqual((image['age'], image['stale'], image['on']), (95.0, False, True))
+        self.assertEqual(yakala.image_lines(image, True)[1], '6×4 · 1 dk önce · Tab ile çıkar')
+        quoted, _ = self.offer('"' + clip + '"', {'image': True, 'png': None, 'dib': make_dib(self.pixels)})
+        self.assertTrue(quoted['on'])
+
+    def test_old_screenshot_is_offered_switched_off(self):
+        for age, label in ((yakala.IMAGE_FRESH + 1, '10 dk önce'), (3 * 3600 + 20, '3 saat önce'), (3 * 86400, '3 gün önce')):
+            image, _ = self.offer(self.shot_file(age=age), {'image': True, 'png': make_png(self.pixels), 'dib': None})
+            self.assertEqual((image['stale'], image['on']), (True, False), age)
+            self.assertEqual(yakala.image_lines(image, False)[1], '6×4 · ' + label + ' · Tab ile ekle')
+        edge, _ = self.offer(self.shot_file(age=yakala.IMAGE_FRESH), {'image': True, 'png': make_png(self.pixels), 'dib': None})
+        self.assertTrue(edge['on'])
+        ahead, _ = self.offer(self.shot_file(age=-30), {'image': True, 'png': make_png(self.pixels), 'dib': None})
+        self.assertEqual((ahead['age'], ahead['on']), (0.0, True))  # clock moved back: not older than now
+
+    def test_deleted_temp_file_means_an_old_screenshot(self):
+        image, _ = self.offer(self.shot_file(age=None), {'image': True, 'png': make_png(self.pixels), 'dib': None})
+        self.assertEqual((image['age'], image['stale'], image['on']), (None, True, False))
+        self.assertEqual(yakala.image_lines(image, False)[1], '6×4 · eski, geçici dosyası silinmiş · Tab ile ekle')
+
+    def test_unreadable_bitmap_falls_back_to_the_screenshot_file(self):
+        clip = self.shot_file(age=20)
+        for payload in ({'image': True, 'png': None, 'dib': None},  # over the size limit
+                        {'image': True, 'png': None, 'dib': make_dib(self.pixels)[:14] + struct.pack('<H', 16) + bytes(200)}):
+            image, _ = self.offer(clip, payload)
+            self.assertEqual(Path(image['path']).read_bytes(), make_png(self.pixels))
+            self.assertTrue(image['on'])
+        self.assertNotEqual(Path(image['path']).parent, Path(clip).parent)  # a copy; the original is never ours to delete
+        not_png = self.shot_file(age=20, content=b'GIF89a' + bytes(64))
+        self.assertIsNone(self.offer(not_png, {'image': True, 'png': None, 'dib': None})[0])
+
+    def test_anything_else_changes_nothing(self):
+        bitmap = {'image': True, 'png': None, 'dib': make_dib(self.pixels)}
+        clip = self.shot_file(age=5)
+        # No picture, no reader on this OS, clipboard busy, a layout the reader refuses.
+        for payload in (None, {}, {'image': False, 'png': None, 'dib': None}, {'image': True, 'png': None, 'dib': None},
+                        {'image': True, 'png': b'bozuk', 'dib': b'bozuk'}):
+            self.assertIsNone(self.offer('', payload)[0], payload)
+        for payload in (None, {'image': False, 'png': None, 'dib': None}):
+            self.assertIsNone(self.offer(clip, payload)[0], payload)  # the path alone, without a picture, stays text
+        # Real text or a link is the capture, as before; the clipboard is not even opened.
+        for text in ('toplantı notu', 'https://ornek.com/yazi', clip + '\nikinci satır', 'bak ' + clip):
+            image, probe = self.offer(text, bitmap)
+            self.assertIsNone(image, text)
+            probe.assert_not_called()
+        # Something better already comes from the context.
+        for context in ({'url': 'https://ornek.com'}, {'dosyalar': ['a.pdf']}, {'metin': 'secili metin'}):
+            image, probe = self.offer('', bitmap, context)
+            self.assertIsNone(image, context)
+            probe.assert_not_called()
+
+    def test_reader_failure_is_swallowed_and_leaves_no_temp_folder(self):
+        made, real = [], tempfile.mkdtemp
+
+        def recording(**options):
+            made.append(real(**options))
+            return made[-1]
+        with patch.object(yakala, '_clipboard_payload', side_effect=OSError('exception: access violation')):
+            self.assertIsNone(yakala.clipboard_image('', {}))
+        with patch.object(yakala, '_clipboard_payload', return_value={'image': True, 'png': make_png(self.pixels), 'dib': None}), \
+                patch.object(yakala.tempfile, 'mkdtemp', recording), \
+                patch.object(yakala.Path, 'write_bytes', side_effect=OSError('disk dolu')):
+            self.assertIsNone(yakala.clipboard_image('', {}))
+        self.assertEqual(len(made), 1)
+        self.assertFalse(Path(made[0]).exists())
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has the reader')
+    def test_other_systems_never_get_an_image(self):
+        self.assertIsNone(yakala._clipboard_payload())
+        self.assertIsNone(yakala.clipboard_image('', {}))
+        self.assertIsNone(yakala.clipboard_image(REPORTED, {}))
+
+    def test_age_words(self):
+        self.assertEqual([yakala._ago(seconds) for seconds in (0, 59, 60, 3599, 3600, 172799, 172800)],
+                         ['az önce', 'az önce', '1 dk önce', '59 dk önce', '1 saat önce', '47 saat önce', '2 gün önce'])
+
+
+class Call:
+    """A foreign function stand-in: callable, and accepts the argtypes/restype the reader declares."""
+
+    def __init__(self, function):
+        self.function = function
+
+    def __call__(self, *args):
+        return self.function(*args)
+
+
+class FakeWin32:
+    """user32 and kernel32 in one: a clipboard of {format: bytes} that checks how the reader treats it."""
+
+    def __init__(self, formats, busy=0, slack=0, unlockable=()):
+        self.formats, self.busy, self.slack, self.unlockable = dict(formats), busy, slack, set(unlockable)
+        self.is_open, self.locked, self.asked, self.closed, self.buffers = False, set(), [], 0, {}
+        for name in ('OpenClipboard', 'CloseClipboard', 'IsClipboardFormatAvailable', 'RegisterClipboardFormatW',
+                     'GetClipboardData', 'GlobalSize', 'GlobalLock', 'GlobalUnlock'):
+            setattr(self, name, Call(getattr(self, '_' + name)))
+
+    def _OpenClipboard(self, _window):
+        assert not self.is_open
+        if self.busy:
+            self.busy -= 1
+            return 0
+        self.is_open = True
+        return 1
+
+    def _CloseClipboard(self):
+        assert self.is_open and not self.locked, 'closed while a payload was still locked'
+        self.is_open, self.closed = False, self.closed + 1
+        return 1
+
+    def _RegisterClipboardFormatW(self, name):
+        return {'PNG': 0xC001, 'image/png': 0xC002}[name]
+
+    def _IsClipboardFormatAvailable(self, code):
+        assert self.is_open
+        return int(code in self.formats)
+
+    def _GetClipboardData(self, code):
+        assert self.is_open
+        self.asked.append(code)
+        return None if self.formats[code] is None else 0x7FF000000000 + code  # None: listed, but the owner gives nothing
+
+    def _GlobalSize(self, handle):
+        data = self.formats[handle - 0x7FF000000000]
+        if isinstance(data, Exception):
+            raise data
+        return len(data) + self.slack
+
+    def _GlobalLock(self, handle):
+        import ctypes
+        assert self.is_open and handle not in self.locked
+        code = handle - 0x7FF000000000
+        if code in self.unlockable:
+            return None
+        self.locked.add(handle)
+        self.buffers[code] = ctypes.create_string_buffer(self.formats[code] + bytes(self.slack), len(self.formats[code]) + self.slack)
+        return ctypes.addressof(self.buffers[code])
+
+    def _GlobalUnlock(self, handle):
+        self.locked.remove(handle)
+        return 0
+
+
+class WindowsReaderFlowTest(unittest.TestCase):
+    """_win_clipboard_payload() against a recording stand-in for user32/kernel32, on every OS.
+
+    The real calls run only on Windows (WindowsClipboardTest); this pins the order: open with a bounded
+    retry, copy each payload under its own lock, always close, never lock what is over the limit.
+    """
+
+    def read(self, formats, limit=None, **options):
+        import ctypes
+        fake = FakeWin32(formats, **options)
+        with patch.object(ctypes, 'WinDLL', lambda _name: fake, create=True), patch.object(time, 'sleep') as sleep:
+            payload = yakala._win_clipboard_payload(**({'limit': limit} if limit else {}))
+        self.assertFalse(fake.is_open)
+        self.assertEqual(fake.locked, set())
+        return payload, fake, sleep
+
+    def test_bitmap_is_copied_with_its_allocation_slack_and_the_clipboard_closed(self):
+        dib = make_dib(picture(3, 2))
+        payload, fake, _ = self.read({8: dib}, slack=5)
+        self.assertEqual(payload, {'image': True, 'png': None, 'dib': dib + bytes(5)})
+        self.assertEqual((fake.asked, fake.closed), ([8], 1))
+        self.assertEqual(decode_png(yakala.dib_to_png(payload['dib'])[0])[3], picture(3, 2))
+
+    def test_valid_png_is_enough_and_a_broken_one_falls_back_to_the_bitmap(self):
+        png, dib = make_png(picture(3, 2)), make_dib(picture(3, 2))
+        for code in (0xC001, 0xC002):  # 'PNG' and 'image/png'
+            payload, fake, _ = self.read({code: png, 8: dib}, slack=3)
+            self.assertEqual(payload, {'image': True, 'png': png + bytes(3), 'dib': None})
+            self.assertEqual(fake.asked, [code])
+        payload, fake, _ = self.read({0xC001: png[:-2], 8: dib})
+        self.assertEqual((payload['png'], payload['dib']), (png[:-2], dib))
+        self.assertEqual(fake.asked, [0xC001, 8])
+
+    def test_busy_clipboard_is_retried_a_bounded_number_of_times(self):
+        dib = make_dib(picture(2, 2))
+        payload, fake, sleep = self.read({8: dib}, busy=3)
+        self.assertEqual((payload['dib'], sleep.call_count, fake.closed), (dib, 3, 1))
+        payload, fake, sleep = self.read({8: dib}, busy=99)
+        self.assertIsNone(payload)
+        self.assertEqual((sleep.call_count, fake.closed, fake.asked), (5, 0, []))
+        self.assertLess(sum(call.args[0] for call in sleep.call_args_list), 0.5)
+
+    def test_oversized_missing_and_unlockable_payloads_are_skipped_not_fatal(self):
+        dib = make_dib(picture(4, 4))
+        empty = {'image': True, 'png': None, 'dib': None}
+        payload, fake, _ = self.read({8: dib}, limit=len(dib) - 1)
+        self.assertEqual((payload, fake.buffers), (empty, {}))  # never locked, never copied
+        self.assertEqual(self.read({8: dib}, limit=len(dib))[0]['dib'], dib)
+        self.assertEqual(self.read({8: None})[0], empty)
+        self.assertEqual(self.read({8: b''})[0], empty)
+        self.assertEqual(self.read({8: dib}, unlockable=[8])[0], empty)
+        self.assertEqual(self.read({13: b'm\0e\0t\0i\0n\0\0\0'})[0], {'image': False, 'png': None, 'dib': None})
+        self.assertEqual(self.read({})[0], {'image': False, 'png': None, 'dib': None})
+
+    def test_error_inside_the_reader_still_closes_the_clipboard(self):
+        import ctypes
+        fake = FakeWin32({8: OSError('exception: access violation reading 0x0000000000000000')})
+        with patch.object(ctypes, 'WinDLL', lambda _name: fake, create=True):
+            with self.assertRaises(OSError):
+                yakala._win_clipboard_payload()
+            self.assertEqual((fake.is_open, fake.closed), (False, 1))
+            with patch.object(yakala, '_clipboard_payload', yakala._win_clipboard_payload):
+                self.assertIsNone(yakala.clipboard_image('', {}))  # the popup sees "no picture", not the error
+        self.assertEqual(fake.closed, 2)
+
+
+class Widget:
+    """Stand-in for a Tk widget: every call the test does not care about is accepted and ignored."""
+
+    def __getattr__(self, name):
+        if name.startswith('__'):
+            raise AttributeError(name)
+        return lambda *args, **options: None
+
+
+class Root(Widget):
+    def __init__(self, script):
+        self.script, self.bound, self.timers, self.seen, self.alive = script, {}, [], [], True
+
+    def bind(self, sequence, handler, add=None):
+        self.bound[sequence] = handler
+
+    def after(self, _delay, handler, *args):
+        self.timers.append((handler, args))
+
+    def winfo_screenwidth(self):
+        return 1440
+
+    def winfo_screenheight(self):
+        return 900
+
+    def destroy(self):
+        self.alive = False
+
+    def mainloop(self):
+        for action, value in self.script:
+            if action == 'key':
+                self.bound[value](None)
+            elif action == 'type':
+                self.entry.type(value)
+            else:
+                self.seen.append((self.entry.text, self.canvas.texts()))
+        for _ in range(400):
+            if not (self.alive and self.timers):
+                break
+            handler, args = self.timers.pop(0)
+            handler(*args)
+
+
+class Entry(Widget):
+    def __init__(self, root, **_options):
+        self.text, self.handlers = '', {}
+        root.entry = self
+
+    def bind(self, sequence, handler, add=None):
+        self.handlers[sequence] = handler
+
+    def delete(self, _first, _last=None):
+        self.text = ''
+
+    def insert(self, _index, text):
+        self.text += text
+
+    def get(self):
+        return self.text
+
+    def type(self, text):
+        self.handlers['<KeyPress>'](types.SimpleNamespace(char=text[0], keysym=text[0]))
+        self.insert('end', text)
+        self.handlers['<KeyRelease>'](None)
+
+
+class Canvas(Widget):
+    def __init__(self, root, **_options):
+        self.items = {}
+        root.canvas = self
+
+    def _create(self, *_coordinates, **options):
+        self.items[len(self.items) + 1] = dict(options)
+        return len(self.items)
+    create_text = create_polygon = create_oval = create_line = create_window = create_image = _create
+
+    def itemconfigure(self, item, **options):
+        self.items[item].update(options)
+
+    def texts(self):
+        return [item['text'] for item in self.items.values() if item.get('text')]
+
+
+class Photo:
+    opened = []
+
+    def __init__(self, master=None, file=None, size=(1920, 1080)):
+        self.size = size
+        if file:
+            assert yakala.png_info(Path(file).read_bytes()), file  # the temp PNG exists while the window is up
+            Photo.opened.append(file)
+
+    def width(self):
+        return self.size[0]
+
+    def height(self):
+        return self.size[1]
+
+    def subsample(self, factor):
+        return Photo(size=(-(-self.size[0] // factor), -(-self.size[1] // factor)))
+
+
+class PopupWiringTest(ScreenshotFiles, unittest.TestCase):
+    """popup() end to end with a scripted tkinter: which card a key sequence produces."""
+
+    def setUp(self):
+        self.make_store('v3-yakala-pencere-')
+        self.vault = Path(self.tmp.name) / 'Örnek Beyin'
+        self.vault.mkdir()
+        self.pixels = picture(8, 5)
+        self.bitmap = {'image': True, 'png': None, 'dib': make_dib(self.pixels, bits=32)}
+        Photo.opened = []
+
+    def popup(self, clip, payload, script, context=None):
+        roots = []
+        fake = types.ModuleType('tkinter')
+        fake.Tk = lambda: roots.append(Root(script)) or roots[-1]
+        fake.Canvas, fake.Entry, fake.PhotoImage, fake.TclError = Canvas, Entry, Photo, RuntimeError
+        fake.font = types.ModuleType('tkinter.font')
+        fake.font.Font = lambda **_options: types.SimpleNamespace(measure=lambda text: len(text) * 6)
+        environment = {key: value for key, value in os.environ.items() if key != 'BEYIN_YAKALA_SNAPSHOT'}
+        with patch.dict(sys.modules, {'tkinter': fake, 'tkinter.font': fake.font}), \
+                patch.dict(os.environ, environment, clear=True), \
+                patch.object(yakala, '_clipboard', return_value=clip), \
+                patch.object(yakala, '_clipboard_payload', return_value=payload, create=True) as probe, \
+                patch.object(yakala, '_style_mac'):
+            result = yakala.popup(self.vault, context)
+        return result, roots[0], probe
+
+    def card(self, result):
+        return yakala.find_card(self.vault, result['id'])
+
+    def saved_files(self):
+        # Only what a capture copied in: the folder may also hold housekeeping dot files.
+        return sorted(path for path in (self.vault / INBOX / 'dosyalar').glob('*') if not path.name.startswith('.'))
+
+    def test_screenshot_becomes_a_file_card_without_the_temp_path(self):
+        result, root, _ = self.popup(self.shot_file(age=40), self.bitmap, [('look', None), ('type', 'hata ekranı'), ('key', '<Return>')])
+        self.assertEqual((result['status'], result['kaynak_turu']), ('yakalandi', 'dosya'))
+        card = self.card(result)
+        self.assertEqual((card['meta']['kaynak_turu'], card['meta']['visibility'], card['meta']['arac']), ('dosya', 'private', 'masaustu'))
+        self.assertNotIn('ScreenClip', card['body'])
+        self.assertNotIn('## Secim', card['body'])
+        self.assertIn('## Neden\n\nhata ekranı', card['body'])
+        files = self.saved_files()
+        self.assertEqual(len(files), 1)
+        self.assertRegex(files[0].name, r'^pano-goruntusu-\d{8}-\d{6}\.png$')
+        self.assertIn('[[' + INBOX + '/dosyalar/' + files[0].name + ']]', card['body'])
+        self.assertEqual(decode_png(files[0].read_bytes())[3], self.pixels)
+        # The picture was on screen before anything was saved, and the temp copy is gone afterwards.
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Neden kaydediyorsun?')
+        self.assertIn('GÖRSEL', texts)
+        self.assertIn('Panodaki görüntü', texts)
+        self.assertIn('8×5 · az önce · Tab ile çıkar', texts)
+        self.assertEqual(len(Photo.opened), 1)
+        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+        self.assertIn('✓  Beyne atıldı', root.canvas.texts())
+
+    def test_tab_takes_the_picture_off_and_the_typed_line_is_the_note(self):
+        result, root, _ = self.popup(self.shot_file(age=40), self.bitmap, [('key', '<Tab>'), ('look', None), ('type', 'yarın ara'), ('key', '<Return>')])
+        self.assertEqual((result['status'], result['kaynak_turu']), ('yakalandi', 'metin'))
+        body = self.card(result)['body']
+        self.assertIn('> yarın ara', body)
+        self.assertNotIn('ScreenClip', body)
+        self.assertNotIn('## Dosyalar', body)
+        self.assertEqual(self.saved_files(), [])
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Aklındakini yaz…')
+        self.assertIn('Panodaki görüntü eklenmeyecek', texts)
+        self.assertIn('8×5 · az önce · Tab ile ekle', texts)
+        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+
+    def test_old_screenshot_waits_for_tab(self):
+        # Hours later the same screenshot is still on the clipboard: shown, but a quick note stays a note.
+        for clip in (self.shot_file(age=3 * 3600), REPORTED):  # an old temp file, and one Windows already deleted
+            script = [('look', None), ('type', 'süt al'), ('key', '<Return>')]
+            result, root, _ = self.popup(clip, self.bitmap, script)
+            self.assertEqual(result['kaynak_turu'], 'metin', clip)
+            body = self.card(result)['body']
+            self.assertIn('> süt al', body)
+            self.assertNotIn('ScreenClip', body)
+            self.assertEqual(self.saved_files(), [])
+            placeholder, texts = root.seen[0]
+            self.assertEqual(placeholder, 'Aklındakini yaz…')
+            self.assertIn('Panodaki görüntü eklenmeyecek', texts)
+        result, root, _ = self.popup(REPORTED, self.bitmap, [('key', '<Tab>'), ('look', None), ('type', 'eski hata'), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'dosya')
+        self.assertEqual(len(self.saved_files()), 1)
+        self.assertIn('8×5 · eski, geçici dosyası silinmiş · Tab ile çıkar', root.seen[0][1])
+
+    def test_picture_of_unknown_age_waits_for_tab(self):
+        # No temp file next to it (a copied web image, an old PrtScn): shown, told how to add it, not attached.
+        result, root, _ = self.popup('', self.bitmap, [('look', None), ('type', 'aklıma gelen'), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'metin')
+        self.assertIn('> aklıma gelen', self.card(result)['body'])
+        self.assertEqual(self.saved_files(), [])
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Aklındakini yaz…')
+        self.assertIn('GÖRSEL', texts)
+        self.assertIn('Panodaki görüntü eklenmeyecek', texts)
+        self.assertIn('8×5 · Tab ile ekle', texts)
+        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+        result, root, _ = self.popup('', self.bitmap, [('key', '<Tab>'), ('look', None), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'dosya')
+        self.assertEqual(len(self.saved_files()), 1)
+        self.assertIn('_(not yok)_', self.card(result)['body'])
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Neden kaydediyorsun?')
+        self.assertIn('Panodaki görüntü', texts)
+        self.assertIn('8×5 · Tab ile çıkar', texts)
+
+    def test_tab_twice_puts_it_back_and_enter_alone_saves_the_picture(self):
+        script = [('key', '<Tab>'), ('key', '<Tab>'), ('look', None), ('key', '<Return>')]
+        result, root, _ = self.popup(self.shot_file(age=40), self.bitmap, script)
+        self.assertEqual(result['kaynak_turu'], 'dosya')
+        self.assertEqual(len(self.saved_files()), 1)
+        self.assertIn('_(not yok)_', self.card(result)['body'])
+        self.assertEqual(root.seen[0][0], 'Neden kaydediyorsun?')
+
+    def test_picture_switched_off_and_nothing_typed_saves_nothing(self):
+        # Off from the start (unknown age), or taken off by hand (fresh screenshot): Enter has nothing to save.
+        for clip, keys in (('', []), (self.shot_file(age=40), [('key', '<Tab>')])):
+            Photo.opened = []
+            result, root, _ = self.popup(clip, self.bitmap, keys + [('key', '<Return>'), ('look', None), ('key', '<Escape>')])
+            self.assertEqual(result, {'status': 'vazgecildi'}, clip)
+            self.assertIn('Önce bir şey yaz', root.seen[0][1])
+            self.assertFalse((self.vault / INBOX).exists())
+            self.assertFalse(Path(Photo.opened[0]).parent.exists())
+
+    def test_escape_saves_nothing_and_removes_the_temp_copy(self):
+        result, _, _ = self.popup(self.shot_file(age=40), self.bitmap, [('key', '<Escape>')])
+        self.assertEqual(result, {'status': 'vazgecildi'})
+        self.assertFalse((self.vault / INBOX).exists())
+        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+
+    def test_text_next_to_a_picture_is_captured_as_before(self):
+        # A spreadsheet copies cells as text and as a bitmap; the text is still the capture.
+        result, root, probe = self.popup('kira 12.500', self.bitmap, [('look', None), ('type', 'bütçe'), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'metin')
+        body = self.card(result)['body']
+        self.assertIn('> kira 12.500', body)
+        self.assertIn('## Neden\n\nbütçe', body)
+        self.assertEqual(self.saved_files(), [])
+        probe.assert_not_called()
+        self.assertNotIn('GÖRSEL', root.seen[0][1])
+        self.assertEqual(Photo.opened, [])
+
+    def test_without_a_picture_the_popup_is_unchanged(self):
+        for payload in (None, {'image': False, 'png': None, 'dib': None}):
+            result, root, _ = self.popup('', payload, [('look', None), ('type', 'aklıma gelen'), ('key', '<Return>')])
+            self.assertEqual(result['kaynak_turu'], 'metin')
+            self.assertIn('> aklıma gelen', self.card(result)['body'])
+            self.assertEqual(root.seen[0][0], 'Aklındakini yaz…')
+            self.assertNotIn('GÖRSEL', root.seen[0][1])
+        # The reader found no picture: the path text is saved exactly as it was before the fix.
+        result, _, _ = self.popup(REPORTED, {'image': False, 'png': None, 'dib': None}, [('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'metin')
+        self.assertIn('> ' + REPORTED, self.card(result)['body'])
+        self.assertEqual(self.saved_files(), [])
+        self.assertEqual(Photo.opened, [])
+
+    def test_link_on_the_clipboard_is_unchanged(self):
+        result, _, probe = self.popup('https://ornek.com/yazi', self.bitmap, [('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'makale')
+        probe.assert_not_called()
+
+
+class StandaloneCopyTest(unittest.TestCase):
+    def test_single_file_copy_runs_alone(self):
+        # The macOS listener runs a copy of this one file from the state folder: no sibling module may be needed.
+        with tempfile.TemporaryDirectory(prefix='v3-yakala-tek-') as folder:
+            copy = Path(folder) / 'beyin_v3_yakala.py'
+            copy.write_bytes((SCRIPTS / 'beyin_v3_yakala.py').read_bytes())
+            code = ('import beyin_v3_yakala as y, os; '
+                    'print(y.png_info(b"") is None, y.clipboard_image("bir not", {}) is None, '
+                    'os.name == "nt" or y.clipboard_image("", {}) is None)')
+            result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, encoding='utf-8',
+                                    cwd=folder, env=inherited_env(PYTHONPATH=folder, PYTHONDONTWRITEBYTECODE='1'), timeout=60)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, 'True True True'), result.stderr)
+
+
+def set_clipboard(formats):
+    """Replace the real clipboard with {format id or registered name: bytes}. Skips when the session has none."""
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.WinDLL('user32'), ctypes.WinDLL('kernel32')
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD] + [ctypes.c_int] * 4 + \
+        [wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes, user32.DestroyWindow.restype = [wintypes.HWND], wintypes.BOOL
+    user32.OpenClipboard.argtypes, user32.OpenClipboard.restype = [wintypes.HWND], wintypes.BOOL
+    user32.EmptyClipboard.argtypes, user32.EmptyClipboard.restype = [], wintypes.BOOL
+    user32.CloseClipboard.argtypes, user32.CloseClipboard.restype = [], wintypes.BOOL
+    user32.RegisterClipboardFormatW.argtypes, user32.RegisterClipboardFormatW.restype = [wintypes.LPCWSTR], wintypes.UINT
+    user32.SetClipboardData.argtypes, user32.SetClipboardData.restype = [wintypes.UINT, wintypes.HANDLE], wintypes.HANDLE
+    kernel32.GlobalAlloc.argtypes, kernel32.GlobalAlloc.restype = [wintypes.UINT, ctypes.c_size_t], wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes, kernel32.GlobalLock.restype = [wintypes.HGLOBAL], wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes, kernel32.GlobalUnlock.restype = [wintypes.HGLOBAL], wintypes.BOOL
+    kernel32.GlobalFree.argtypes, kernel32.GlobalFree.restype = [wintypes.HGLOBAL], wintypes.HGLOBAL
+    # EmptyClipboard needs an owner window, or SetClipboardData is refused.
+    owner = user32.CreateWindowExW(0, 'STATIC', None, 0, 0, 0, 0, 0, None, None, None, None)
+    if not owner:
+        raise unittest.SkipTest('bu oturumda pencere acilamiyor; pano kullanilamaz')
+    try:
+        for _ in range(40):
+            if user32.OpenClipboard(owner):
+                break
+            time.sleep(0.05)
+        else:
+            raise unittest.SkipTest('pano acilamadi; bu oturumda kullanilabilir pano yok')
+        try:
+            if not user32.EmptyClipboard():
+                raise unittest.SkipTest('pano bosaltilamadi')
+            for key, data in formats.items():
+                code = key if isinstance(key, int) else user32.RegisterClipboardFormatW(key)
+                handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+                pointer = kernel32.GlobalLock(handle) if handle else None
+                if not pointer:
+                    raise unittest.SkipTest('pano icin bellek ayrilamadi')
+                ctypes.memmove(pointer, data, len(data))
+                kernel32.GlobalUnlock(handle)
+                if not user32.SetClipboardData(code, handle):
+                    kernel32.GlobalFree(handle)
+                    raise unittest.SkipTest('panoya yazilamadi')
+        finally:
+            user32.CloseClipboard()
+    finally:
+        user32.DestroyWindow(owner)
+
+
+def file_drop(*paths):
+    """CF_HDROP payload: DROPFILES header, then wide paths, each and the list ending in NUL."""
+    return struct.pack('<IiiII', 20, 0, 0, 0, 1) + ''.join(str(path) + '\0' for path in paths).encode('utf-16-le') + b'\0\0'
+
+
+@unittest.skipUnless(os.name == 'nt' and (os.environ.get('CI') or os.environ.get('BEYIN_TEST_PANO')),
+                     'replaces the real Windows clipboard: CI runners, or BEYIN_TEST_PANO=1')
+class WindowsClipboardTest(unittest.TestCase):
+    """The real reader against the real clipboard, filled through ctypes with synthetic payloads."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-winpano-')
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(set_clipboard, {})
+        self.vault = Path(self.tmp.name) / 'Örnek Beyin'
+        self.vault.mkdir()
+        self.pixels = picture(7, 5)
+
+    def payload(self, **options):
+        # A clipboard listener (history, remote desktop) may hold the clipboard for a moment after a change.
+        for _ in range(20):
+            found = yakala._win_clipboard_payload(**options)
+            if found is not None:
+                return found
+            time.sleep(0.1)
+        self.skipTest('pano okunamadi; baska bir surec birakmiyor')
+
+    def image(self, clip=''):
+        self.payload()
+        image = yakala.clipboard_image(clip, {})
+        self.assertIsNotNone(image)
+        self.addCleanup(yakala._image_done, image)
+        return image
+
+    def test_bitmap_round_trip(self):
+        for options in ({'bits': 24}, {'bits': 32}, {'bits': 32, 'top_down': True}, {'bits': 24, 'top_down': True}):
+            set_clipboard({8: make_dib(self.pixels, **options)})
+            payload = self.payload()
+            self.assertTrue(payload['image'], options)
+            self.assertIsNone(payload['png'])
+            made = yakala.dib_to_png(payload['dib'])
+            self.assertIsNotNone(made, options)
+            self.assertEqual(decode_png(made[0])[3], self.pixels, options)
+
+    def test_png_format_is_taken_as_it_is(self):
+        png = make_png(self.pixels)
+        for name in ('PNG', 'image/png'):
+            set_clipboard({name: png, 8: make_dib(picture(2, 2))})
+            payload = self.payload()
+            self.assertEqual(payload['png'][:len(png)], png, name)
+            self.assertIsNone(payload['dib'])  # a valid PNG makes the bitmap unnecessary
+            image = self.image()
+            self.assertEqual(Path(image['path']).read_bytes(), png)
+            self.assertEqual((image['age'], image['stale'], image['on']), (None, False, False))  # no temp file: the user decides
+
+    def test_broken_png_falls_back_to_the_bitmap(self):
+        set_clipboard({'PNG': make_png(self.pixels)[:-9], 8: make_dib(self.pixels)})
+        self.assertEqual(decode_png(Path(self.image()['path']).read_bytes())[3], self.pixels)
+
+    def test_size_limit_and_no_picture(self):
+        nothing = {'image': False, 'png': None, 'dib': None}
+        set_clipboard({8: make_dib(self.pixels)})
+        self.assertEqual(self.payload(limit=64), {'image': True, 'png': None, 'dib': None})
+        set_clipboard({13: 'yalnız metin\0'.encode('utf-16-le')})
+        self.assertEqual(self.payload(), nothing)
+        self.assertIsNone(yakala.clipboard_image('', {}))
+        set_clipboard({})
+        self.assertEqual(self.payload(), nothing)
+        self.assertIsNone(yakala.clipboard_image('', {}))
+
+    def screenshot(self):
+        path = Path(self.tmp.name) / 'Packages' / 'Ornek.Uygulama_abc' / 'TempState' / 'ScreenClip' / '{0A1B2C3D}.png'
+        path.parent.mkdir(parents=True)
+        path.write_bytes(make_png(self.pixels))
+        set_clipboard({8: make_dib(self.pixels, bits=32), 15: file_drop(path)})
+        return path
+
+    def test_screenshot_with_file_drop_becomes_a_file_card(self):
+        path = self.screenshot()
+        clip = str(path).replace('\\', '/')  # how Tk reports the file drop
+        self.assertEqual(yakala.snip_path(clip), clip)
+        image = self.image(clip)
+        self.assertTrue(image['on'])
+        self.assertLess(image['age'], yakala.IMAGE_FRESH)
+        self.assertEqual(decode_png(Path(image['path']).read_bytes())[3], self.pixels)
+        result = yakala.capture(self.vault, files=[image['path']], why='ekran')
+        self.assertEqual(result['kaynak_turu'], 'dosya')
+        os.utime(path, (time.time() - 7200, time.time() - 7200))
+        stale = self.image(clip)
+        self.assertEqual((stale['stale'], stale['on']), (True, False))
+        path.unlink()
+        gone = self.image(clip)
+        self.assertEqual((gone['age'], gone['stale'], gone['on']), (None, True, False))
+
+    def test_tk_reports_the_file_drop_as_text_and_reads_the_png(self):
+        path = self.screenshot()
+        self.payload()
+        try:
+            import tkinter
+            root = tkinter.Tk()
+        except Exception as exc:
+            self.skipTest('tkinter penceresi acilamadi: ' + type(exc).__name__)
+        try:
+            root.withdraw()
+            clip = yakala._clipboard(root).strip()
+            # This is the text the popup used to save as the note; the fix depends on recognising it.
+            self.assertEqual(clip, str(path).replace('\\', '/'))
+            self.assertEqual(yakala.snip_path(clip), clip)
+            thumb = yakala._image_thumb(root, self.image(clip))
+            self.assertIsNotNone(thumb)  # Tk decodes the PNG this module wrote
+            self.assertEqual((thumb.width(), thumb.height()), (7, 5))
+            del thumb
+        finally:
+            root.destroy()
+
+
+if __name__ == '__main__':
+    unittest.main()
