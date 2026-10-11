@@ -9,11 +9,15 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import unicodedata
 import unittest
 from unittest import mock
+
+from v3_package_helpers import inherited_env, install
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'template/.claude/scripts'
@@ -358,6 +362,103 @@ class VendoredHintTest(unittest.TestCase):
             report = index_settings.doctor(state, None, sources)
             self.assertEqual((report['status'], report['excluded_dirs']), ('invalid', []))
             self.assertIn('error', report)
+
+
+class InstalledCliTest(unittest.TestCase):
+    """The real install: preferences sets the list, sync applies and shows it, doctor reads it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='beyin-index-cli-')
+        root = Path(cls.tmp.name).resolve()
+        cls.vault, cls.state, home = root / 'vault', root / 'state', root / 'home'
+        cls.vault.mkdir()
+        home.mkdir()
+        cls.env = inherited_env(HOME=str(home), USERPROFILE=str(home), APPDATA=str(home / 'appdata'),
+                                LOCALAPPDATA=str(home / 'localappdata'), BEYIN_V3_NO_SPAWN='1',
+                                PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8')
+        for relative in ('notlar/gercek.md', 'Vendor/Acme Tedarik.md', 'proje/3rdparty/SDL2/README.md',
+                         'proje/3rdparty/SDL2/SECURITY.md', 'proje/3rdparty/SPIRV/docs/guide.md'):
+            path = cls.vault / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(('Nebula calibration ' + relative + '\n').encode('utf-8'))
+        installed = install(cls.vault, cls.state, cls.env)
+        assert installed.returncode == 0, installed.stderr
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def beyin(self, *arguments, human=False):
+        done = subprocess.run([sys.executable, str(self.vault / 'beyin.py'), *arguments, '--human' if human else '--json'],
+                              cwd=self.vault, env=self.env, capture_output=True, timeout=120)
+        text = (done.stdout if not done.returncode else done.stderr).decode('utf-8', errors='replace')
+        return done.returncode, text if human else json.loads(text)
+
+    def indexed(self):
+        db = sqlite3.connect(str(self.state / 'memory.sqlite3'))
+        try:
+            return sorted(row[0] for row in db.execute('SELECT source FROM markdown_sources'))
+        finally:
+            db.close()
+
+    def test_hint_then_list_then_agreement_between_doctor_and_index(self):
+        code, synced = self.beyin('sync')
+        self.assertEqual(code, 0, synced)
+        self.assertNotIn('index_exclusions', synced)
+        self.assertNotIn('index_exclusions', self.beyin('preferences')[1])
+        vendored = [source for source in self.indexed() if source.startswith('proje/3rdparty/')]
+        self.assertEqual(len(vendored), 3)
+        report = self.beyin('doctor')[1]['index_exclusions']
+        self.assertEqual(report, {'file': 'index.json', 'excluded_dirs': [], 'status': 'none',
+                                  'always_excluded': ['__pycache__', 'node_modules', 'receipts'],
+                                  'vendored_hint': {'notes': 3, 'dirs': [{'dir': 'proje/3rdparty', 'notes': 3}],
+                                                    'names': ['3rdparty'], 'truncated': False}})
+        human = self.beyin('doctor', human=True)[1]
+        self.assertIn('Indeks kapsami (bilgi): baska projelerin kod kopyasi gibi gorunen klasorlerde 3 not indeksli '
+                      '(proje/3rdparty: 3).', human)
+        self.assertIn('beyin.py preferences --index-exclude-dir 3rdparty', human)
+        self.assertNotIn('Vendor', human, 'a notes folder without upstream documents is not pointed at')
+        self.assertFalse((self.state / 'index.json').exists(), 'doctor only reads')
+
+        # A refused name changes nothing and says why.
+        code, refused = self.beyin('preferences', '--index-exclude-dir', '3rdparty', '--index-exclude-dir', 'notes')
+        self.assertEqual(code, 1)
+        self.assertIn('read back through the index', refused['message'])
+        self.assertFalse((self.state / 'index.json').exists())
+
+        code, saved = self.beyin('preferences', '--index-exclude-dir', '3rdparty')
+        self.assertEqual((code, saved['status'], saved['index_exclusions']), (0, 'saved', {'excluded_dirs': ['3rdparty']}))
+        self.assertIn('Indeks disi klasor adlari (senin listen, her derinlikte): 3rdparty.', self.beyin('preferences', human=True)[1])
+        code, synced = self.beyin('sync')
+        self.assertEqual((synced['status'], synced['deleted']), ('succeeded', 3))
+        self.assertEqual(synced['index_exclusions'], {'excluded_dirs': ['3rdparty'], 'pruned': 1, 'pruned_dirs': ['proje/3rdparty']})
+        self.assertIn('3rdparty (bu taramada 1 klasor atlandi).', self.beyin('sync', human=True)[1])
+        self.assertEqual([source for source in self.indexed() if '3rdparty' in source], [])
+        self.assertIn('Vendor/Acme Tedarik.md', self.indexed())
+        report = self.beyin('doctor')[1]['index_exclusions']
+        self.assertEqual((report['status'], report['excluded_dirs'], 'vendored_hint' in report), ('active', ['3rdparty'], False))
+        self.assertIn('Indeks disi klasor adlari (senin listen, her derinlikte): 3rdparty.', self.beyin('doctor', human=True)[1])
+
+        # A damaged file is shown by all three commands and refused by the next change.
+        (self.state / 'index.json').write_bytes(b'{not json')
+        code, synced = self.beyin('sync')
+        self.assertEqual((code, synced['status'], synced['index_exclusions']['error']), (0, 'succeeded', 'not valid JSON'))
+        self.assertEqual(len([source for source in self.indexed() if '3rdparty' in source]), 3)
+        code, doctor = self.beyin('doctor')
+        self.assertEqual((doctor['index_exclusions']['status'], doctor['index_exclusions']['error']), ('invalid', 'not valid JSON'))
+        self.assertIn('index.json gecersiz (not valid JSON); klasor haric tutma listesi uygulanmiyor', self.beyin('doctor', human=True)[1])
+        self.assertIn('index.json gecersiz', self.beyin('preferences', human=True)[1])
+        code, refused = self.beyin('preferences', '--index-exclude-dir', 'target')
+        self.assertEqual(code, 1)
+        self.assertIn('fix or remove it first', refused['message'])
+        self.assertEqual((self.state / 'index.json').read_bytes(), b'{not json')
+
+        (self.state / 'index.json').unlink()
+        code, saved = self.beyin('preferences', '--index-exclude-dir', '3rdparty', '--index-exclude-dir', 'target')
+        self.assertEqual(saved['index_exclusions'], {'excluded_dirs': ['3rdparty', 'target']})
+        code, saved = self.beyin('preferences', '--index-include-dir', '3RDPARTY')
+        self.assertEqual(saved['index_exclusions'], {'excluded_dirs': ['target']})
 
 
 if __name__ == '__main__':

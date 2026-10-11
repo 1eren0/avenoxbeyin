@@ -405,6 +405,10 @@ def parser():
     settings.add_argument("--inbox-folder", action="append",
                           help="Top-level inbox folder name for the report (repeat for several; replaces the "
                                "generic name detection; an empty value returns to it)")
+    settings.add_argument("--index-exclude-dir", action="append", default=[], metavar="NAME",
+                          help="Keep directories with this bare name out of the index, at any depth (repeatable); applied by the next sync")
+    settings.add_argument("--index-include-dir", action="append", default=[], metavar="NAME",
+                          help="Remove a name from the index exclusion list (repeatable)")
     settings.add_argument("--parallel-sessions", choices=("on", "off"),
                           help="Opt-in one-line notice when another session is open on this vault")
     compact = sub.add_parser("companion-compact", help="Move older Last-Session/Threads entries verbatim into a private archive; deletes nothing")
@@ -524,6 +528,10 @@ def main(argv=None, return_result=False):
                 if not inbox_valid:
                     raise ValueError('inbox-report.json in the runtime state is invalid; fix or remove it first')
                 hygiene.check_inbox_settings(dict(current_inbox, **inbox_changes))
+            import beyin_v3_index as index_settings
+            index_changes = bool(args.index_exclude_dir or args.index_include_dir)
+            if index_changes:  # validated before anything is saved
+                index_settings.plan(state, vault, args.index_exclude_dir, args.index_include_dir)
             if hygiene_changes:  # validated before anything is saved, like the companion limits
                 current_hygiene, hygiene_valid = hygiene.read_settings(state)
                 if not hygiene_valid:
@@ -608,6 +616,20 @@ def main(argv=None, return_result=False):
                 result['inbox_report'], inbox_valid = hygiene.read_inbox_settings(state)
                 if not inbox_valid:
                     result['inbox_report_notice'] = 'inbox-report.json gecersiz; gelen kutusu raporu kapali sayiliyor.'
+            # Machine-local index setting (state/index.json); a release before it ignores the file.
+            if index_changes:
+                result['index_exclusions'] = {'excluded_dirs': index_settings.save(
+                    state, vault, args.index_exclude_dir, args.index_include_dir)}
+                result['index_exclusions_notice'] = 'Klasor haric tutma listesi kaydedildi; bir sonraki sync ile uygulanir.'
+                result['status'] = 'saved'
+            else:
+                excluded_names, index_error, index_present = index_settings.read(state, vault)
+                if index_present:  # a vault that never set this keeps its exact output
+                    result['index_exclusions'] = {'excluded_dirs': excluded_names}
+                if index_error is not None:
+                    result['index_exclusions']['error'] = index_error
+                    result['index_exclusions_notice'] = ('index.json gecersiz; klasor haric tutma listesi uygulanmiyor, '
+                                                         'her sey indeksleniyor.')
             # Machine-local (#170): an older release would reject a new .beyin-preferences.json key.
             import beyin_v3_parallel as parallel
             if args.parallel_sessions is not None:
@@ -762,6 +784,19 @@ def main(argv=None, return_result=False):
                 result['parallel_sessions'] = parallel.doctor(state)
             except Exception as exc:
                 result['parallel_sessions'] = {'status': 'unavailable', 'error': type(exc).__name__}
+            # Information only: the user's index exclusions, an index.json that is not applied, and
+            # indexed trees that look vendored. Reads the index and one small file; no vault walk.
+            try:
+                import beyin_v3_index as index_settings
+                try:
+                    with store._connect() as db:
+                        indexed_sources = [row[0] for row in db.execute('SELECT source FROM markdown_sources')]
+                except Exception:  # no sync has created the table yet
+                    indexed_sources = []
+                result['index_exclusions'] = index_settings.doctor(state, vault, indexed_sources)
+                result['index_exclusions']['always_excluded'] = sorted(sys.modules['beyin_v3_sync'].EXCLUDED_DIRS)
+            except Exception as exc:  # never hides the rest of doctor
+                result['index_exclusions'] = {'status': 'unavailable', 'error': type(exc).__name__}
             result['receipt_line_endings'] = receipt_line_endings(vault)  # information only: the status below is untouched
             result['status'] = ('needs_attention' if health.get('sync', {}).get('status') in ('conflict', 'degraded') or result['hook_paths'].get('status') == 'stale' or result['skill_conflicts'] or result.get('instruction_conflicts') or result['hook-error.json'] or result['task_completion']['strict_issue_count'] or result['task_completion'].get('error') or result['validity']['ignored_rejection_count'] or result['validity'].get('error') else 'pending' if result['pending_events'] else 'observed_metadata' if result['acknowledged_events'] else 'never_seen')
             # Information only: a leftover global OMP hook copy predates the vault-owned plan
