@@ -741,7 +741,7 @@ def _fit(canvas, text, font, width):
 # file-drop entry for a temp file that Windows deletes later. Tk hands that entry to clipboard_get() as
 # text, so the popup saved the path and lost the picture. Pure helpers first, then the reader and the card.
 
-IMAGE_FRESH = 600  # seconds; an older screenshot is shown but stays off until the user turns it on
+IMAGE_FRESH = 600  # seconds; only a screenshot younger than this starts switched on, the rest waits for Tab
 IMAGE_LIMIT = 64 * 1024 * 1024  # bytes taken from the clipboard; two 4K screens side by side fit as a bitmap
 PNG_MAGIC = b'\x89PNG\r\n\x1a\n'
 # The reported path is ...\AppData\Local\Packages\<app>\TempState\ScreenClip\{GUID}.png. Any picture under a
@@ -895,8 +895,8 @@ def clipboard_image(clip, context, at=None):
 
     Offered only when nothing else would be saved: no page, file or text from the context, and the
     clipboard text is empty or just the screenshot's own temp path. Real text or a link stays the capture
-    exactly as before. Age is known only from that temp file: older than IMAGE_FRESH, or already deleted,
-    means the picture starts switched off. Any failure returns None, which is the old behaviour.
+    exactly as before. Only a provably fresh screenshot starts switched on: its temp file is still there
+    and younger than IMAGE_FRESH. Every other picture is shown and waits for Tab. Failure returns None.
     """
     import time
     folder = None
@@ -927,11 +927,11 @@ def clipboard_image(clip, context, at=None):
             age = max(0.0, at - os.path.getmtime(own)) if own else None
         except OSError:
             age = None  # Windows already deleted the temp file: not a screenshot from a moment ago
-        stale = bool(own) and (age is None or age > IMAGE_FRESH)
+        fresh = age is not None and age <= IMAGE_FRESH  # an agent reads what is saved: no proof, no attachment
         folder = tempfile.mkdtemp(prefix='beyin-yakala-')
         path = Path(folder) / ('pano-goruntusu-' + datetime.fromtimestamp(at).strftime('%Y%m%d-%H%M%S') + '.png')
         path.write_bytes(png)
-        return {'path': str(path), 'folder': folder, 'width': size[0], 'height': size[1], 'age': age, 'stale': stale, 'on': not stale}
+        return {'path': str(path), 'folder': folder, 'width': size[0], 'height': size[1], 'age': age, 'stale': bool(own) and not fresh, 'on': fresh}
     except Exception:
         if folder:
             shutil.rmtree(folder, ignore_errors=True)

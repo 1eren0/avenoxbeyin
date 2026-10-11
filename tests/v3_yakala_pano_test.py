@@ -238,9 +238,10 @@ class ImageOfferTest(ScreenshotFiles, unittest.TestCase):
             self.addCleanup(yakala._image_done, image)
         return image, probe
 
-    def test_bitmap_only_clipboard_is_offered_switched_on(self):
+    def test_picture_without_a_temp_file_is_offered_switched_off(self):
+        # A copied web image or an old PrtScn has no age: an agent reads what is saved, so the user decides.
         image, _ = self.offer('', {'image': True, 'png': None, 'dib': make_dib(self.pixels, bits=32)})
-        self.assertEqual((image['width'], image['height'], image['age'], image['stale'], image['on']), (6, 4, None, False, True))
+        self.assertEqual((image['width'], image['height'], image['age'], image['stale'], image['on']), (6, 4, None, False, False))
         path = Path(image['path'])
         self.assertRegex(path.name, r'^pano-goruntusu-\d{8}-\d{6}\.png$')
         self.assertEqual(decode_png(path.read_bytes())[3], self.pixels)
@@ -659,19 +660,44 @@ class PopupWiringTest(ScreenshotFiles, unittest.TestCase):
         self.assertEqual(len(self.saved_files()), 1)
         self.assertIn('8×5 · eski, geçici dosyası silinmiş · Tab ile çıkar', root.seen[0][1])
 
+    def test_picture_of_unknown_age_waits_for_tab(self):
+        # No temp file next to it (a copied web image, an old PrtScn): shown, told how to add it, not attached.
+        result, root, _ = self.popup('', self.bitmap, [('look', None), ('type', 'aklıma gelen'), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'metin')
+        self.assertIn('> aklıma gelen', self.card(result)['body'])
+        self.assertEqual(self.saved_files(), [])
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Aklındakini yaz…')
+        self.assertIn('GÖRSEL', texts)
+        self.assertIn('Panodaki görüntü eklenmeyecek', texts)
+        self.assertIn('8×5 · Tab ile ekle', texts)
+        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+        result, root, _ = self.popup('', self.bitmap, [('key', '<Tab>'), ('look', None), ('key', '<Return>')])
+        self.assertEqual(result['kaynak_turu'], 'dosya')
+        self.assertEqual(len(self.saved_files()), 1)
+        self.assertIn('_(not yok)_', self.card(result)['body'])
+        placeholder, texts = root.seen[0]
+        self.assertEqual(placeholder, 'Neden kaydediyorsun?')
+        self.assertIn('Panodaki görüntü', texts)
+        self.assertIn('8×5 · Tab ile çıkar', texts)
+
     def test_tab_twice_puts_it_back_and_enter_alone_saves_the_picture(self):
-        result, root, _ = self.popup('', self.bitmap, [('key', '<Tab>'), ('key', '<Tab>'), ('look', None), ('key', '<Return>')])
+        script = [('key', '<Tab>'), ('key', '<Tab>'), ('look', None), ('key', '<Return>')]
+        result, root, _ = self.popup(self.shot_file(age=40), self.bitmap, script)
         self.assertEqual(result['kaynak_turu'], 'dosya')
         self.assertEqual(len(self.saved_files()), 1)
         self.assertIn('_(not yok)_', self.card(result)['body'])
         self.assertEqual(root.seen[0][0], 'Neden kaydediyorsun?')
 
     def test_picture_switched_off_and_nothing_typed_saves_nothing(self):
-        result, root, _ = self.popup('', self.bitmap, [('key', '<Tab>'), ('key', '<Return>'), ('look', None), ('key', '<Escape>')])
-        self.assertEqual(result, {'status': 'vazgecildi'})
-        self.assertIn('Önce bir şey yaz', root.seen[0][1])
-        self.assertFalse((self.vault / INBOX).exists())
-        self.assertFalse(Path(Photo.opened[0]).parent.exists())
+        # Off from the start (unknown age), or taken off by hand (fresh screenshot): Enter has nothing to save.
+        for clip, keys in (('', []), (self.shot_file(age=40), [('key', '<Tab>')])):
+            Photo.opened = []
+            result, root, _ = self.popup(clip, self.bitmap, keys + [('key', '<Return>'), ('look', None), ('key', '<Escape>')])
+            self.assertEqual(result, {'status': 'vazgecildi'}, clip)
+            self.assertIn('Önce bir şey yaz', root.seen[0][1])
+            self.assertFalse((self.vault / INBOX).exists())
+            self.assertFalse(Path(Photo.opened[0]).parent.exists())
 
     def test_escape_saves_nothing_and_removes_the_temp_copy(self):
         result, _, _ = self.popup(self.shot_file(age=40), self.bitmap, [('key', '<Escape>')])
@@ -825,7 +851,9 @@ class WindowsClipboardTest(unittest.TestCase):
             payload = self.payload()
             self.assertEqual(payload['png'][:len(png)], png, name)
             self.assertIsNone(payload['dib'])  # a valid PNG makes the bitmap unnecessary
-            self.assertEqual(Path(self.image()['path']).read_bytes(), png)
+            image = self.image()
+            self.assertEqual(Path(image['path']).read_bytes(), png)
+            self.assertEqual((image['age'], image['stale'], image['on']), (None, False, False))  # no temp file: the user decides
 
     def test_broken_png_falls_back_to_the_bitmap(self):
         set_clipboard({'PNG': make_png(self.pixels)[:-9], 8: make_dib(self.pixels)})
