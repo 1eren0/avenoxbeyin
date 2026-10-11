@@ -240,12 +240,14 @@ def _index_excluded(state, vault):
     Such a tree is not the user's notes, so the word cap leaves it alone like a code folder.
     Without a state, a list or a valid file nothing is skipped, as before the setting existed.
     """
+    if state is None:
+        return lambda name: False
     try:
         directory = str(Path(__file__).resolve().parent)
         if directory not in sys.path:  # loaded by file path: keep the adjacent module importable
             sys.path.insert(0, directory)
         from beyin_v3_index import dir_key, exclusions
-        keys = exclusions(state, vault)[0] if state is not None else frozenset()
+        keys = exclusions(state, vault)[0]
     except Exception:  # a report or a hook signal never fails on this setting
         keys = frozenset()
     if not keys:

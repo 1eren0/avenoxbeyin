@@ -40,22 +40,36 @@ def dir_key(name):
     and dotless i fold together (U+0130, I, U+0131 and i are one letter here), so a name typed
     in any case matches the folder; str.casefold() alone keeps U+0130 and U+0131 apart from i.
     """
+    if name.isascii():
+        return name.casefold()
     text = unicodedata.normalize('NFC', name).replace('\u0130', 'i').replace('\u0131', 'i')
     return unicodedata.normalize('NFC', text.casefold().replace('i\u0307', 'i'))
 
 
-def protected_keys(vault):
-    names = set(PROTECTED_DIRS) | {DEFAULT_DIRECTORY}
+_PROTECTED_KEYS = frozenset(dir_key(name) for name in PROTECTED_DIRS + (DEFAULT_DIRECTORY,))
+
+
+def companion_key(vault, keys):
+    """The key of this vault's companion folder when the list names it, else None.
+
+    The folder is resolved only when a top-level entry carries a listed name. A vault with
+    thousands of files at its root then pays one directory listing per sync for this check,
+    not a stat per entry.
+    """
+    if vault is None or not keys:
+        return None
     try:
-        target = companion_directory(vault) if vault is not None else None
-        if target is not None:
-            names.add(target.name)
+        with os.scandir(vault) as entries:
+            if not any(dir_key(entry.name) in keys for entry in entries):
+                return None
+        target = companion_directory(vault)
     except OSError:
-        pass  # the fixed names still hold; an unreadable vault fails in the walk itself
-    return frozenset(dir_key(name) for name in names)
+        return None  # an unreadable vault fails in the walk itself
+    key = dir_key(target.name) if target is not None else None
+    return key if key in keys else None
 
 
-def check(value, protected=frozenset()):
+def check(value, vault=None):
     """The validated name list, first spelling of each name kept; ValueError says what is wrong.
 
     All or nothing: one bad entry refuses the file, so a typo is reported instead of half applied.
@@ -65,18 +79,19 @@ def check(value, protected=frozenset()):
     names = value.get('excluded_dirs', [])
     if not isinstance(names, list) or len(names) > MAX_EXCLUDED_DIRS:
         raise ValueError(f'excluded_dirs must be a list of at most {MAX_EXCLUDED_DIRS} directory names')
-    result, seen = [], set()
+    result, seen = [], {}
     for name in names:
         if not isinstance(name, str) or not name.strip() or name != name.strip() or len(name) > MAX_NAME_CHARS:
             raise ValueError('excluded_dirs entries must be directory names without surrounding spaces: ' + repr(name)[:80])
         if '/' in name or '\\' in name or name in ('.', '..') or any(ord(char) < 32 or ord(char) == 127 for char in name):
             raise ValueError('excluded_dirs takes bare directory names, matched at any depth, not paths: ' + repr(name)[:80])
         key = dir_key(name)
-        if key in protected:
-            raise ValueError('this folder is read back through the index and cannot be excluded: ' + repr(name)[:80])
         if key not in seen:
-            seen.add(key)
+            seen[key] = name
             result.append(name)
+    refused = next((key for key in seen if key in _PROTECTED_KEYS), None) or companion_key(vault, seen)
+    if refused is not None:
+        raise ValueError('this folder is read back through the index and cannot be excluded: ' + repr(seen[refused])[:80])
     return result
 
 
@@ -102,8 +117,7 @@ def read(state, vault=None):
     except ValueError:  # json.JSONDecodeError and UnicodeDecodeError
         return [], 'not valid JSON', True
     try:
-        listed = isinstance(value, dict) and value.get('excluded_dirs')
-        return check(value, protected_keys(vault) if listed else frozenset()), None, True
+        return check(value, vault), None, True
     except ValueError as exc:
         return [], str(exc), True
 
@@ -141,7 +155,7 @@ def plan(state, vault, add=(), remove=()):
     dropped = {dir_key(name) for name in remove}
     names = [name for name in names if dir_key(name) not in dropped]
     names += [unicodedata.normalize('NFC', name) for name in add]
-    return check({'excluded_dirs': names}, protected_keys(vault))
+    return check({'excluded_dirs': names}, vault)
 
 
 def save(state, vault, add=(), remove=()):

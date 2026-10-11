@@ -298,6 +298,11 @@ class RefusedConfigTest(EngineFixture):
         self.everything = sorted(self.everything + ['Hafıza Echo/Core.md'])
         self.config({'excluded_dirs': ['hafıza echo']})
         self.refused('read back through the index')
+        # Another top-level folder beside the companion is the user's to exclude.
+        self.note('Vendor/Acme Tedarik.md', 'Nebula calibration supplier.\n')
+        self.config({'excluded_dirs': ['vendor']})
+        report = self.engine.sync()['index_exclusions']
+        self.assertEqual((report.get('error'), report['pruned_dirs']), (None, ['Vendor']))
 
 
 class SettingsFileTest(unittest.TestCase):
