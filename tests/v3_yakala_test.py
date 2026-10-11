@@ -313,6 +313,13 @@ class YakalaUnitTest(unittest.TestCase):
         self.assertIn('ikinci bakış', body)
         self.assertEqual(yakala.pending(self.vault), 1)
 
+    def test_capture_treats_a_bare_link_as_url(self):
+        result = yakala.capture(self.vault, text='  https://www.youtube.com/watch?v=abc\n', app='brave')
+        meta = yakala.find_card(self.vault, result['id'])['meta']
+        self.assertEqual((meta['kaynak_turu'], meta['url']), ('youtube', 'https://www.youtube.com/watch?v=abc'))
+        prose = yakala.capture(self.vault, text='bak https://example.com guzel')
+        self.assertEqual(yakala.find_card(self.vault, prose['id'])['meta']['kaynak_turu'], 'metin')
+
     def test_capture_requires_something(self):
         with self.assertRaises(ValueError):
             yakala.capture(self.vault, why='yalniz neden')

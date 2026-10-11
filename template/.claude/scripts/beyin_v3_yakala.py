@@ -298,6 +298,8 @@ def capture(vault, url=None, text=None, files=(), why='', app=None, title=None, 
     vault = Path(vault)
     url = (url or '').strip() or None
     text = (text or '').strip() or None
+    if not url and text and re.fullmatch(r'https?://\S+', text):  # a copied link is a source, not a selection
+        url, text = text, None
     why = (why or '').strip()
     files = [Path(f).expanduser() for f in files]
     if not (url or text or files):
