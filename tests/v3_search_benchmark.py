@@ -46,9 +46,8 @@ class SearchBenchmarkTest(unittest.TestCase):
         self.assertGreaterEqual(non_strict["recall_at_5"], 0.95, "Baseline non-strict Recall@5 drop")
         self.assertLessEqual(non_strict["median_latency_ms"], 150.0, "Latency ceiling exceeded")
 
-        # Strict search: only floors, never ceilings. Single-term queries score 0 today
-        # (STRICT_MIN_SHARED=2); that is reported as a measured gap, not pinned, so a
-        # correct future improvement cannot fail this test.
+        # Strict search: only floors, never ceilings. Single-term queries are now
+        # eligible under a separate weight floor; benchmark recall must not regress.
         strict = report["modes"]["strict"]
         self.assertGreaterEqual(strict["recall_at_1"], 0.75, "Baseline strict Recall@1 drop")
 
