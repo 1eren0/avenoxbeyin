@@ -196,7 +196,8 @@ def limits(mode):
 def auto_context(store, harness, query, context, *, budget_chars, timeout_cap=2.0, transport=None, project=None):
     """Per-turn hook path: strict local matches plus a loose lexical pool, judged in one call.
 
-    The strict matcher wants two shared words, so a paraphrased question finds nothing. The
+    Multiword strict queries require two shared words (one-word queries require one), so
+    a paraphrased question can still find nothing. The
     loose pool passes the same visibility, trust, freshness and supersession gates; only the
     word-overlap bar is lower, and a loose record enters only above AUTO_RESCUE. Any failure
     or doubt returns the strict result untouched.
