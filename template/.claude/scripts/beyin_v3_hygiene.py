@@ -29,6 +29,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 import time
 import unicodedata
@@ -233,6 +234,25 @@ def save_settings(state, changes):
     return result
 
 
+def _index_excluded(state, vault):
+    """Predicate for directory names the user keeps out of the index (state/index.json).
+
+    Such a tree is not the user's notes, so the word cap leaves it alone like a code folder.
+    Without a state, a list or a valid file nothing is skipped, as before the setting existed.
+    """
+    try:
+        directory = str(Path(__file__).resolve().parent)
+        if directory not in sys.path:  # loaded by file path: keep the adjacent module importable
+            sys.path.insert(0, directory)
+        from beyin_v3_index import dir_key, exclusions
+        keys = exclusions(state, vault)[0] if state is not None else frozenset()
+    except Exception:  # a report or a hook signal never fails on this setting
+        keys = frozenset()
+    if not keys:
+        return lambda name: False
+    return lambda name: dir_key(name) in keys
+
+
 def companion_names(vault, state=None):
     """Top-level folder names (NFC) that hold companion memory and stay fully exempt.
 
@@ -381,6 +401,9 @@ def file_over_cap(vault, path, cap=DEFAULT_CAP, state=None):
     relative = _vault_relative(vault, path)
     if relative is None or _excluded(relative, companion_names(vault, state)):
         return None
+    skipped = _index_excluded(state, vault)
+    if any(skipped(part) for part in relative.split('/')[:-1]):
+        return None
     try:
         text = path.read_text(encoding='utf-8', errors='replace')
     except (OSError, ValueError):
@@ -395,6 +418,7 @@ def cap_scan(vault, cap=DEFAULT_CAP, limit=20, state=None):
     """Over-cap user notes across the vault. Informational; the doctor runs it only when opted in."""
     vault = Path(vault).resolve()
     companions = companion_names(vault, state)
+    skipped = _index_excluded(state, vault)
     over, checked, visited, truncated = [], 0, 0, False
     for directory, folders, files in os.walk(vault):
         visited += 1
@@ -407,7 +431,7 @@ def cap_scan(vault, cap=DEFAULT_CAP, limit=20, state=None):
             continue
         folders[:] = [name for name in folders if not name.startswith('.') and name not in CAP_EXCLUDED_DIRS
                       and name not in CODE_DIRS and _nfc(name) not in companions and not _archive(name)
-                      and not (top and sensitive_excluded(name))]
+                      and not (top and sensitive_excluded(name)) and not skipped(name)]
         for name in files:
             if SKILL_OR_INDEX.search(name) or not name.endswith('.md') or name.startswith('.'):
                 continue

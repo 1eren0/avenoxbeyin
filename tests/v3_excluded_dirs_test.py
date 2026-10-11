@@ -364,6 +364,27 @@ class VendoredHintTest(unittest.TestCase):
             self.assertIn('error', report)
 
 
+class WordCapTest(unittest.TestCase):
+    def test_word_cap_leaves_an_excluded_tree_alone(self):
+        hygiene = load_file('beyin_v3_hygiene_exclude_subject', SCRIPTS / 'beyin_v3_hygiene.py')
+        with tempfile.TemporaryDirectory(prefix='beyin-index-cap-') as tmp:
+            root = Path(tmp).resolve()
+            vault, state = root / 'vault', root / 'state'
+            for relative in ('Makaleler/uzun.md', 'proje/3rdparty/SDL2/uzun.md'):
+                path = vault / relative
+                path.parent.mkdir(parents=True)
+                path.write_bytes(('kelime ' * 600).encode('utf-8'))
+            state.mkdir()
+            vendored = vault / 'proje/3rdparty/SDL2/uzun.md'
+            self.assertEqual([entry['file'] for entry in hygiene.cap_scan(vault, state=state)['over']],
+                             ['Makaleler/uzun.md', 'proje/3rdparty/SDL2/uzun.md'])
+            self.assertEqual(hygiene.file_over_cap(vault, vendored, state=state), (600, True))
+            (state / 'index.json').write_bytes(b'{"excluded_dirs": ["3rdParty"]}')
+            self.assertEqual([entry['file'] for entry in hygiene.cap_scan(vault, state=state)['over']], ['Makaleler/uzun.md'])
+            self.assertIsNone(hygiene.file_over_cap(vault, vendored, state=state))
+            self.assertEqual(hygiene.file_over_cap(vault, vault / 'Makaleler/uzun.md', state=state), (600, True))
+
+
 class InstalledCliTest(unittest.TestCase):
     """The real install: preferences sets the list, sync applies and shows it, doctor reads it."""
 
