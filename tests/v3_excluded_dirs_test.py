@@ -487,5 +487,158 @@ class InstalledCliTest(unittest.TestCase):
         self.assertEqual(saved['index_exclusions'], {'excluded_dirs': ['target']})
 
 
+# Reads the real database the way the SessionStart hook does: read-only, without a sync first.
+RECEIPT_READER = '''import json, sqlite3, sys
+from pathlib import Path
+vault, state = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(vault / '.claude/scripts'))
+from beyin_v3_projections import latest_receipts, recent_receipts
+db = sqlite3.connect((state / 'memory.sqlite3').resolve().as_uri() + '?mode=ro', uri=True)
+try:
+    latest = next((event['summary'] for _, event in latest_receipts(db, vault)), None)
+    recap = {item['summary']: [item['refs'], item.get('refs_withheld')] for item in recent_receipts(db, vault=vault)['items']}
+finally:
+    db.close()
+print(json.dumps({'latest': latest, 'recap': recap}))
+'''
+
+
+class ExcludedRefTest(unittest.TestCase):
+    """Excluding a directory must not weaken the gate that withholds private refs.
+
+    A ref under an excluded directory has no record, so its visibility is unknown; recap
+    withholds it like a private one and the SessionStart receipt gate skips its receipt.
+    Real install, real database rows.
+    """
+
+    GENERAL, OPEN, PRIVATE = 'Zirkongenel karar kaydi.', 'Zirkonacik ozet kaydi.', 'Zirkongizli ayrinti kaydi.'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='beyin-index-refs-')
+        root = Path(cls.tmp.name).resolve()
+        cls.vault, cls.state, home = root / 'vault', root / 'state', root / 'home'
+        cls.vault.mkdir()
+        home.mkdir()
+        cls.env = inherited_env(HOME=str(home), USERPROFILE=str(home), APPDATA=str(home / 'appdata'),
+                                LOCALAPPDATA=str(home / 'localappdata'), BEYIN_V3_NO_SPAWN='1',
+                                PYTHONDONTWRITEBYTECODE='1', PYTHONIOENCODING='utf-8')
+        for relative, text in (('notlar/genel.md', 'Genel not.\n'), ('Çalışma/acik.md', 'Acik not.\n'),
+                               ('Çalışma/gizli.md', '---\nvisibility: private\n---\nGizli not.\n')):
+            path = cls.vault / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text.encode('utf-8'))
+        installed = install(cls.vault, cls.state, cls.env)
+        assert installed.returncode == 0, installed.stderr
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def beyin(self, *arguments):
+        done = subprocess.run([sys.executable, str(self.vault / 'beyin.py'), *arguments, '--json'], cwd=self.vault,
+                              env=self.env, capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', errors='replace'))
+        return json.loads(done.stdout.decode('utf-8'))
+
+    def rows(self, query):
+        db = sqlite3.connect(str(self.state / 'memory.sqlite3'))
+        try:
+            return [row[0] for row in db.execute(query)]
+        finally:
+            db.close()
+
+    def recap(self):
+        return {item['summary']: (item['refs'], item.get('refs_withheld')) for item in self.beyin('recap')['items']}
+
+    def unsynced(self):
+        done = subprocess.run([sys.executable, '-c', RECEIPT_READER, str(self.vault), str(self.state)],
+                              cwd=self.vault, env=self.env, capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', errors='replace'))
+        return json.loads(done.stdout.decode('utf-8'))
+
+    def session_start(self):
+        done = subprocess.run([sys.executable, str(self.vault / '.claude/scripts/beyin_v3_hook.py'), '--vault', str(self.vault),
+                               '--state', str(self.state), '--harness', 'claude'], cwd=self.vault, env=self.env,
+                              input=json.dumps({'hook_event_name': 'SessionStart', 'session_id': 'synthetic-refs',
+                                                'prompt': 'Zirkon kayitlari'}).encode('utf-8'),
+                              capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', errors='replace'))
+        return done.stdout.decode('utf-8')
+
+    def test_a_ref_under_an_excluded_directory_stays_withheld(self):
+        self.beyin('sync')
+        for event, summary, refs in (('synthetic-general', self.GENERAL, ['notlar/genel.md']),
+                                     ('synthetic-open', self.OPEN, ['Çalışma/acik.md']),
+                                     ('synthetic-private', self.PRIVATE, ['Çalışma/gizli.md', 'notlar/genel.md'])):
+            self.beyin('receipt', '--event-id', event, '--summary', summary, *[part for ref in refs for part in ('--ref', ref)])
+        withheld = {'private': 1, 'missing': 0}
+
+        # Indexed: the private record itself withholds its ref, and its receipt never opens a session.
+        self.assertEqual(sorted(self.rows("SELECT source FROM markdown_sources WHERE source LIKE 'Çalışma/%'")),
+                         ['Çalışma/acik.md', 'Çalışma/gizli.md'])
+        recap = self.recap()
+        self.assertEqual(recap[self.PRIVATE], (['notlar/genel.md'], withheld))
+        self.assertEqual(recap[self.OPEN], (['Çalışma/acik.md'], None))
+        self.assertEqual(self.unsynced()['latest'], self.OPEN)
+        opening = self.session_start()
+        self.assertIn(self.OPEN, opening)
+        self.assertNotIn(self.PRIVATE, opening)
+
+        # Excluded: the records are gone, the gate holds, and it now covers every path below.
+        self.beyin('preferences', '--index-exclude-dir', 'ÇALIŞMA')  # typed in capitals
+        self.assertEqual(self.beyin('sync')['index_exclusions']['pruned_dirs'], ['Çalışma'])
+        self.assertEqual(self.rows("SELECT source FROM markdown_sources WHERE source LIKE 'Çalışma/%'"), [])
+        recap = self.recap()
+        self.assertEqual(recap[self.PRIVATE], (['notlar/genel.md'], withheld), 'the private path must not start to show')
+        self.assertEqual(recap[self.OPEN], ([], withheld), 'visibility is unknown without a record: withheld')
+        self.assertEqual(recap[self.GENERAL], (['notlar/genel.md'], None))
+        # The folded name is stored with the index, in the transaction that removed the records.
+        self.assertEqual(self.rows("SELECT value FROM metadata WHERE key='index_excluded_dirs'"),
+                         [json.dumps([index_settings.dir_key('Çalışma')], ensure_ascii=False)])
+        self.assertEqual(self.unsynced()['latest'], self.GENERAL)
+        opening = self.session_start()
+        self.assertIn(self.GENERAL, opening)
+        self.assertNotIn(self.PRIVATE, opening, 'the receipt about a private note must not open a session')
+        self.assertNotIn('gizli.md', opening)
+
+        # The name leaves index.json but no sync has run: the records are still missing, so the
+        # stored list (committed with the index) must keep withholding. index.json alone would not.
+        self.beyin('preferences', '--index-include-dir', 'çalışma')
+        self.assertEqual(json.loads((self.state / 'index.json').read_bytes().decode('utf-8'))['excluded_dirs'], [])
+        self.assertEqual(self.rows("SELECT source FROM markdown_sources WHERE source LIKE 'Çalışma/%'"), [])
+        unsynced = self.unsynced()
+        self.assertEqual(unsynced['recap'][self.PRIVATE], [['notlar/genel.md'], withheld])
+        self.assertEqual(unsynced['latest'], self.GENERAL)
+
+        # Included again: the records are back and decide for themselves.
+        self.beyin('sync')
+        self.assertEqual(sorted(self.rows("SELECT source FROM markdown_sources WHERE source LIKE 'Çalışma/%'")),
+                         ['Çalışma/acik.md', 'Çalışma/gizli.md'])
+        self.assertEqual(self.rows("SELECT value FROM metadata WHERE key='index_excluded_dirs'"), [])
+        recap = self.recap()
+        self.assertEqual(recap[self.PRIVATE], (['notlar/genel.md'], withheld))
+        self.assertEqual(recap[self.OPEN], (['Çalışma/acik.md'], None))
+        self.assertEqual(self.unsynced()['latest'], self.OPEN)
+
+        # Names the walk skips anyway stay no-ops here too: listing receipts must not hide every receipt.
+        self.beyin('preferences', '--index-exclude-dir', 'receipts', '--index-exclude-dir', '.claude')
+        self.beyin('sync')
+        self.assertEqual(self.rows("SELECT value FROM metadata WHERE key='index_excluded_dirs'"), [])
+        self.assertEqual(self.unsynced()['latest'], self.OPEN)
+        self.assertEqual(self.recap()[self.PRIVATE], (['notlar/genel.md'], withheld))
+
+        # The stored names follow the list from one name to another, not only to and from empty.
+        self.beyin('preferences', '--index-exclude-dir', 'Çalışma')
+        self.beyin('sync')
+        self.beyin('preferences', '--index-include-dir', 'Çalışma', '--index-exclude-dir', 'notlar')
+        self.beyin('sync')
+        self.assertEqual(self.rows("SELECT value FROM metadata WHERE key='index_excluded_dirs'"), ['["notlar"]'])
+        recap = self.recap()
+        self.assertEqual(recap[self.OPEN], (['Çalışma/acik.md'], None))
+        self.assertEqual(recap[self.GENERAL], ([], withheld))
+        self.assertEqual(recap[self.PRIVATE], ([], {'private': 2, 'missing': 0}))
+
+
 if __name__ == '__main__':
     unittest.main()

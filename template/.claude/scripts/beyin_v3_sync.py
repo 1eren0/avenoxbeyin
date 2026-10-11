@@ -18,7 +18,7 @@ if _MODULE_DIR not in sys.path:
 
 from beyin_v3 import (HARNESSES, REJECTED_AT, RETIRED_STATUSES, MemoryStore, ReceiptConflict, RevisionConflict, _json,
                       _path_redirected, _rejected_inference, _status_word, rejected_dependents, resolve_supersedes)
-from beyin_v3_index import dir_key, exclusions as index_exclusions, prune as prune_excluded
+from beyin_v3_index import applied_keys, dir_key, exclusions as index_exclusions, prune as prune_excluded
 from beyin_v3_projections import project_receipts
 from beyin_v3_preferences import read as read_preferences
 from beyin_v3_secrets import redact as redact_secrets, record as record_redactions
@@ -285,6 +285,8 @@ def _has_conflict_markers(text):
 class SyncEngine:
     # What the last scan skipped on the user's word; None while no index.json exists.
     index_exclusions = None
+    # Folded names that scan took out of the index; None until a scan has run on this engine.
+    excluded_dir_keys = None
 
     def projection_helpers(self):
         return _hash, atomic, render
@@ -567,6 +569,8 @@ class SyncEngine:
         duplicate = set()
         # Read once per sync, not per directory: the config cannot change mid-walk.
         excluded, self.index_exclusions = index_exclusions(self.state, self.root)
+        # project_receipts stores these in this sync's transaction for the receipt readers.
+        self.excluded_dir_keys = applied_keys(excluded, EXCLUDED_DIRS)
         for directory, dirs, files in os.walk(self.root, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.casefold() not in EXCLUDED_DIRS and not (Path(directory) / d).is_symlink())
             if excluded:

@@ -134,6 +134,17 @@ def exclusions(state, vault=None):
     return frozenset(dir_key(name) for name in names), report
 
 
+def applied_keys(keys, walk_skips=()):
+    """The listed names that take something out of the index.
+
+    The walk skips dot directories and its own names (walk_skips) with or without the list, so
+    listing one of those changes nothing in the index. It must change nothing for the readers
+    that withhold a path under an excluded directory either: `receipts` in the list would hide
+    every receipt.
+    """
+    return frozenset(key for key in keys if not key.startswith('.') and key not in walk_skips)
+
+
 def prune(root, directory, dirs, keys, report):
     """Drop the excluded names from one os.walk level and note what was skipped."""
     kept = []
