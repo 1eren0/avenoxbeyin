@@ -174,27 +174,24 @@ class JsonTextTest(unittest.TestCase):
 class BrowserUrlTest(unittest.TestCase):
     """The active tab's link comes from the Chromium address bar; anything else is not a link."""
 
-    def read(self, value, code=0):
-        done = subprocess.CompletedProcess([], code, stdout=value.encode('utf-8'), stderr=b'')
-        with patch.object(yakala.subprocess, 'run', return_value=done) as run:
-            url = yakala.windows_browser_url(42)
-        self.assertIn('FromHandle([IntPtr]42)', run.call_args.args[0][-1])
-        return url
-
     def test_address_bar_values(self):
-        self.assertEqual(self.read('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
-        self.assertEqual(self.read('http://127.0.0.1:8080/x'), 'http://127.0.0.1:8080/x')
-        self.assertEqual(self.read('https://github.com/avenoxai'), 'https://github.com/avenoxai')
-        self.assertIsNone(self.read('yarim kalmis arama'))
-        self.assertIsNone(self.read('brave://settings'))
-        self.assertIsNone(self.read('localhost'))
-        self.assertIsNone(self.read(''))
-        self.assertIsNone(self.read('github.com', code=1))
+        self.assertEqual(yakala.tab_url('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
+        self.assertEqual(yakala.tab_url('http://127.0.0.1:8080/x'), 'http://127.0.0.1:8080/x')
+        self.assertEqual(yakala.tab_url('https://github.com/avenoxai'), 'https://github.com/avenoxai')
+        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', '', None):
+            self.assertIsNone(yakala.tab_url(value), value)
 
-    def test_powershell_missing_or_slow_gives_nothing(self):
-        for error in (OSError('yok'), subprocess.TimeoutExpired('powershell.exe', 4)):
-            with patch.object(yakala.subprocess, 'run', side_effect=error):
-                self.assertIsNone(yakala.windows_browser_url(42))
+    def test_reader_failure_falls_back_to_the_clipboard(self):
+        with patch.object(yakala, '_uia_address_bar', side_effect=OSError('UI Automation yok')):
+            self.assertIsNone(yakala.windows_browser_url(42))
+        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai') as read:
+            self.assertEqual(yakala.windows_browser_url(42), 'https://github.com/avenoxai')
+        read.assert_called_once_with(42)
+
+    @unittest.skipUnless(WINDOWS, 'UI Automation is Windows only')
+    def test_real_ui_automation_with_a_dead_window_gives_nothing(self):
+        # The real COM path end to end: ElementFromHandle fails on a closed handle and nothing escapes.
+        self.assertIsNone(yakala.windows_browser_url(0))
 
 
 class FakeSession:

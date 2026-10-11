@@ -931,33 +931,73 @@ def windows_context():
 
 
 WIN_CHROMIUM = {'chrome', 'brave', 'msedge', 'vivaldi', 'opera', 'opera_gx', 'chromium', 'arc'}
-_ADDRESS_BAR = r'''
-Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
-$w = [Windows.Automation.AutomationElement]::FromHandle([IntPtr]%d)
-$c = New-Object Windows.Automation.PropertyCondition([Windows.Automation.AutomationElement]::ControlTypeProperty, [Windows.Automation.ControlType]::Edit)
-$e = $w.FindFirst([Windows.Automation.TreeScope]::Descendants, $c)
-if ($e) { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $e.GetCurrentPattern([Windows.Automation.ValuePattern]::Pattern).Current.Value }
-'''
+def _com_call(obj, index, *args, argtypes=()):
+    """Call slot `index` of a COM interface's vtable (IUnknown takes 0-2)."""
+    import ctypes
+    vtable = ctypes.cast(ctypes.cast(obj, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtable[index])(obj, *args)
 
 
-def windows_browser_url(window):
-    """Active tab URL of a Chromium browser, read from its address bar through UI Automation.
+def _uia_address_bar(window):
+    """Text of the first Edit control under `window`, via IUIAutomation in-process (no PowerShell, ~20-100 ms)."""
+    import ctypes
+    import uuid
+    from ctypes import wintypes
 
-    Chromium hides the scheme, so a bare host/path gains https://. Anything that is not a
-    plain link (a half-typed search, chrome:// pages) yields None and the popup falls back to the clipboard.
-    """
+    class GUID(ctypes.Structure):
+        _fields_ = [('a', ctypes.c_uint32), ('b', ctypes.c_uint16), ('c', ctypes.c_uint16), ('d', ctypes.c_ubyte * 8)]
+
+    class VARIANT(ctypes.Structure):
+        _fields_ = [('vt', ctypes.c_ushort), ('r1', ctypes.c_ushort), ('r2', ctypes.c_ushort), ('r3', ctypes.c_ushort),
+                    ('v1', ctypes.c_void_p), ('v2', ctypes.c_void_p)]
+
+    def guid(text):
+        u = uuid.UUID(text)
+        return GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+
+    out = ctypes.POINTER(ctypes.c_void_p)
+    ctypes.windll.ole32.CoInitializeEx(None, 2)  # S_FALSE on a thread that already has COM is fine
+    uia, element, condition, found = (ctypes.c_void_p() for _ in range(4))
     try:
-        result = subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', _ADDRESS_BAR % int(window)],
-                                capture_output=True, timeout=4, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    value = result.stdout.decode('utf-8', 'replace').strip() if result.returncode == 0 else ''
+        ctypes.oledll.ole32.CoCreateInstance(ctypes.byref(guid('ff48dba4-60ef-4201-aa87-54103eef594e')), None, 1,
+                                             ctypes.byref(guid('30cbe57d-d9d0-452a-ab13-7ac5ac4825ee')), ctypes.byref(uia))
+        _com_call(uia, 6, wintypes.HWND(window), ctypes.byref(element), argtypes=(wintypes.HWND, out))  # ElementFromHandle
+        edit = VARIANT(vt=3, v1=50004)  # VT_I4, UIA_EditControlTypeId
+        _com_call(uia, 23, 30003, edit, ctypes.byref(condition), argtypes=(ctypes.c_int, VARIANT, out))  # CreatePropertyCondition
+        _com_call(element, 5, 4, condition, ctypes.byref(found), argtypes=(ctypes.c_int, ctypes.c_void_p, out))  # FindFirst, descendants
+        if not found:
+            return None
+        value = VARIANT()
+        _com_call(found, 10, 30045, ctypes.byref(value), argtypes=(ctypes.c_int, ctypes.POINTER(VARIANT)))  # ValueValue
+        text = ctypes.wstring_at(value.v1) if value.vt == 8 and value.v1 else None  # VT_BSTR
+        ctypes.windll.oleaut32.VariantClear(ctypes.byref(value))
+        return text
+    finally:
+        for obj in (found, condition, element, uia):
+            if obj:
+                _com_call(obj, 2)  # Release
+
+
+def tab_url(value):
+    """A Chromium address bar value as a link. Chromium hides the scheme, so a bare host/path gains https://.
+
+    Anything that is not a plain link (a half-typed search, chrome:// pages) yields None.
+    """
+    value = (value or '').strip()
     if not value or re.search(r'\s', value):
         return None
     if not re.match(r'[a-z][a-z0-9+.-]*://', value, re.I):
         value = 'https://' + value
     parsed = urlparse(value)
     return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
+
+
+def windows_browser_url(window):
+    """Active tab URL of a Chromium browser, read from its address bar; None falls back to the clipboard."""
+    try:
+        return tab_url(_uia_address_bar(window))
+    except Exception:
+        return None
 
 
 def _try(command, timeout=5):
