@@ -155,9 +155,10 @@ class PassageContextTest(Vault):
         self.assertEqual([r['id'] for r in records], ['rich'])
         self.assertIn(ANSWER, records[0]['text'])
 
-    def test_single_shared_word_and_unrelated_prompts_abstain(self):
+    def test_single_keyword_finds_a_passage_but_unrelated_prompts_abstain(self):
         self.ingest('rich', RICH, 'projects/kuzey.md')
-        for query in ('zirkon', 'teşekkürler harika oldu', 'bugün hava çok güzel'):
+        self.assertEqual(self.sources('zirkon'), ['projects/kuzey.md'])
+        for query in ('zirkon kuantum', 'teşekkürler harika oldu', 'bugün hava çok güzel'):
             result = self.strict(query)
             self.assertEqual(result['records'], [], query)
             self.assertTrue(result['abstained'])
@@ -192,7 +193,8 @@ class PassageContextTest(Vault):
 
     def test_project_words_do_not_count_as_matches(self):
         self.ingest('a', 'Kuzey projesinde zirkon seçildi.', 'knowledge/a.md', project='kuzey')
-        self.assertEqual(self.sources('kuzey zirkon', project='kuzey'), [])
+        self.assertEqual(self.sources('kuzey', project='kuzey'), [])
+        self.assertEqual(self.sources('kuzey zirkon', project='kuzey'), ['knowledge/a.md'])
 
     def test_turkish_inflections_reach_the_passage(self):
         self.ingest('lib', '# Arşiv\n\n' + FILLER + '\n\nKütüphane yedeklemesi her pazar alınır.', 'knowledge/lib.md')
