@@ -10,11 +10,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from v3_package_helpers import inherited_env
 from v3_package_helpers import clean_environ, isolated_path
@@ -1604,6 +1605,130 @@ class YakalaInstalledTest(unittest.TestCase):
         skill = (self.vault / '.agents/skills/beyin-yakala/SKILL.md').read_text(encoding='utf-8')
         self.assertIn('`000-Inbox/Yakala/`', skill)
         self.assertFalse((self.vault / '📥 000-Inbox').exists())
+
+
+# A captured URL (clipboard, Web Clipper card, shared link) is content the user did not write.
+# On Windows a helper resolved to a .cmd/.bat shim is launched through cmd.exe, which acts on
+# & | < > ^ ( ) " % in the arguments. The URL used below carries those characters plus a tail
+# that, if cmd.exe ran it, would create a marker file inside the test's own temp folder (and
+# nothing else). The command-building logic runs on every OS; the execution checks are Windows only.
+META_URL = 'https://example.test/watch?v=1&break>MARKER.txt&a|b(c)^d%TEMP%'
+MARKER = 'MARKER.txt'
+
+
+class YakalaWindowsCommandUnitTest(unittest.TestCase):
+    """Pure command-building rules in _windows_safe_command; no child process is spawned."""
+
+    def test_unsafe_is_oserror_so_callers_fall_back(self):
+        # via_defuddle/via_subtitles/via_audio already catch OSError and take the fallback path.
+        self.assertTrue(issubclass(yakala._UnsafeBatchArgument, OSError))
+
+    def test_real_executable_is_left_untouched(self):
+        command = ['C:/Tools/yt-dlp.exe', '-x', META_URL, '--no-playlist']
+        self.assertEqual(yakala._windows_safe_command(command), command)
+
+    def test_npm_shim_is_rewritten_to_direct_node_call(self):
+        with tempfile.TemporaryDirectory(prefix='v3-winshim-') as tmp:
+            node = Path(tmp) / 'node.exe'
+            script = Path(tmp) / 'node_modules' / 'npm' / 'bin' / 'npx-cli.js'
+            npx = Path(tmp) / 'npx.cmd'
+            script.parent.mkdir(parents=True)
+            for path in (node, script, npx):
+                path.write_text('', encoding='utf-8')
+            command = [str(npx), '-y', yakala.DEFUDDLE, 'parse', META_URL, '--json', '--markdown']
+            rewritten = yakala._windows_safe_command(command)
+        # node.exe takes its arguments through CreateProcess, so cmd.exe is never involved and the
+        # URL survives as a single argument next to the trailing flags.
+        self.assertEqual(rewritten, [str(node), str(script), '-y', yakala.DEFUDDLE, 'parse',
+                                     META_URL, '--json', '--markdown'])
+        self.assertTrue(rewritten[0].lower().endswith('node.exe'))
+
+    def test_npm_shim_without_node_layout_is_declined(self):
+        with tempfile.TemporaryDirectory(prefix='v3-winshim-') as tmp:
+            npx = Path(tmp) / 'npx.cmd'
+            npx.write_text('', encoding='utf-8')
+            with self.assertRaises(yakala._UnsafeBatchArgument):
+                yakala._windows_safe_command([str(npx), '-y', yakala.DEFUDDLE, 'parse', META_URL])
+
+    def test_other_batch_helper_with_metacharacter_is_declined(self):
+        for arg in (META_URL, 'https://e.test/%41', 'a&b', 'a|b', 'a>b', 'a"b', 'a(b)', 'a^b',
+                    'line\nbreak'):
+            with self.assertRaises(yakala._UnsafeBatchArgument):
+                yakala._windows_safe_command(['C:/tools/tool.bat', arg])
+
+    def test_batch_helper_with_plain_arguments_is_allowed(self):
+        command = ['C:/tools/tool.bat', 'parse', 'https://example.test/plain-path']
+        self.assertEqual(yakala._windows_safe_command(command), command)
+
+    def test_via_defuddle_falls_back_when_run_declines(self):
+        # When _run declines a batch shim it raises an OSError, which via_defuddle already catches;
+        # the page path then takes via_stdlib. (os.name is not patched here: pathlib picks its
+        # flavour from it, so faking 'nt' off-Windows is unsafe.)
+        with patch.object(yakala, '_run', side_effect=yakala._UnsafeBatchArgument('npx.cmd')):
+            result = yakala.via_defuddle('https://example.test/x?a=1&b=2', {'npx': 'npx.cmd'})
+        self.assertIsNone(result)
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows cmd.exe argument handling')
+class YakalaWindowsRunTest(unittest.TestCase):
+    """Real child processes on Windows. On 3.9.0 these fail: the marker command runs and the URL
+    is truncated at the first metacharacter; with the fix cmd.exe is never reached."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='v3-winrun-')
+        self.addCleanup(self.tmp.cleanup)
+        self.work = Path(self.tmp.name)
+        self.marker = self.work / MARKER
+        old = os.getcwd()
+        os.chdir(self.work)  # so a relative MARKER.txt can only land inside the temp folder
+        self.addCleanup(os.chdir, old)
+
+    def _batch(self, name):
+        path = self.work / name
+        path.write_text('@echo off\r\nexit /b 0\r\n', encoding='ascii')
+        return path
+
+    def _node_layout(self):
+        real = shutil.which('node')
+        if not real:
+            self.skipTest('node.exe not on PATH')
+        node = self.work / 'node.exe'
+        shutil.copy(real, node)
+        recorder = self.work / 'node_modules' / 'npm' / 'bin' / 'npx-cli.js'
+        recorder.parent.mkdir(parents=True)
+        recorder.write_text("const fs=require('fs'),path=require('path');\n"
+                            "fs.writeFileSync(path.join(__dirname,'received.json'),"
+                            "JSON.stringify(process.argv.slice(2)));\n"
+                            "process.stdout.write(JSON.stringify({content:'x'.repeat(120)}));\n",
+                            encoding='ascii')
+        self._batch('npx.cmd')  # what 3.9.0 would run instead
+        return self.work / 'npx.cmd', recorder
+
+    def test_npm_shim_runs_through_node_with_url_intact(self):
+        npx, recorder = self._node_layout()
+        command = [str(npx), '-y', 'parse', META_URL, '--json', '--markdown']
+        yakala._run(command, timeout=60, cwd=self.work)
+        self.assertFalse(self.marker.exists())  # cmd.exe never executed the injected tail
+        received = json.loads((recorder.parent / 'received.json').read_text(encoding='utf-8'))
+        self.assertEqual(received, ['-y', 'parse', META_URL, '--json', '--markdown'])
+
+    def test_via_defuddle_bypasses_cmd(self):
+        npx, _ = self._node_layout()
+        result = yakala.via_defuddle(META_URL, {'npx': str(npx)})
+        self.assertFalse(self.marker.exists())
+        self.assertEqual(result, 'x' * 120)
+
+    def test_npx_without_node_layout_is_declined(self):
+        npx = self._batch('npx.cmd')  # no sibling node.exe / npx-cli.js
+        with self.assertRaises(OSError):
+            yakala._run([str(npx), '-y', 'parse', META_URL, '--json'], timeout=60, cwd=self.work)
+        self.assertFalse(self.marker.exists())
+
+    def test_other_batch_helper_is_declined(self):
+        tool = self._batch('tool.bat')
+        with self.assertRaises(OSError):
+            yakala._run([str(tool), META_URL], timeout=60, cwd=self.work)
+        self.assertFalse(self.marker.exists())
 
 
 if __name__ == '__main__':

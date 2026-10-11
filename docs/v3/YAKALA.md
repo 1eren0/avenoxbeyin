@@ -203,6 +203,10 @@ Hiçbiri zorunlu değil; varsa işleme genişler, yoksa elde olanla devam edilir
 - **Whisper**: Mac'te `mlx_whisper`, diğerlerinde `whisper` ya da `whisper-ctranslate2`. Ses indirmeyi istemezsen `isle --ses-yok`.
 - **pdftotext** (Poppler): PDF metni.
 
+Windows'ta bu araçlar bir `.cmd`/`.bat` sarmalayici olarak kuruluysa, argumanlar komut
+yorumlayicidan (cmd.exe) gecmeden dogrudan calistirilir; bu mumkun degilse o arac atlanir ve
+elde olanla devam edilir.
+
 ## Gizlilik
 
 - Yakalama ağa çıkmaz; yalnız vault'a bir dosya yazar.
