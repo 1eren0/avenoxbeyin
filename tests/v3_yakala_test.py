@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,15 @@ SCRIPTS = ROOT / 'template/.claude/scripts'
 INBOX = '📥 000-Inbox/Yakala'
 sys.path.insert(0, str(SCRIPTS))
 import beyin_v3_yakala as yakala  # noqa: E402
+
+
+def public_dns_fixture(test):
+    # Helpers below are real offline subprocess stand-ins, so DNS must also stay deterministic.
+    patcher = patch.object(socket, 'getaddrinfo', return_value=[
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))])
+    patcher.start()
+    test.addCleanup(patcher.stop)
+
 
 # Stands in for `npx defuddle`, `yt-dlp` and `whisper` as a real child process. It answers from
 # scenario.json next to it, logs every command line to calls.jsonl and never opens a socket. A subtitle
@@ -1214,6 +1224,7 @@ class YakalaVideoLanguageTest(unittest.TestCase):
     and warns only on evidence of a wrong one (a known mismatch, or a dubbed video of unknown language)."""
 
     def setUp(self):
+        public_dns_fixture(self)
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-dil-')
         self.addCleanup(self.tmp.cleanup)
         self.vault, self.bin = Path(self.tmp.name) / 'Örnek Beyin', Path(self.tmp.name) / 'bin'
@@ -1496,6 +1507,13 @@ class YakalaInstalledTest(unittest.TestCase):
             (tools / name).write_text('#!/bin/sh\nexec ' + shlex.join([sys.executable, str(tools / 'fake_tool.py'), name])
                                       + ' "$@"\n', encoding='utf-8')
             (tools / name).chmod(0o755)
+        # The installed entry is a new interpreter, so its DNS fixture travels through a temporary
+        # sitecustomize alongside the stand-in tools. Production code has no fixture/environment bypass.
+        (tools / 'sitecustomize.py').write_text(
+            "import socket\n"
+            "socket.getaddrinfo = lambda host, port, *a, **kw: [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', port))]\n",
+            encoding='utf-8')
+        self.env['PYTHONPATH'] = str(tools)
         self.env['PATH'] = isolated_path(tools)
         added = self.entry('ekle', VIDEO, '--neden', 'dublaj')
         entry = self.entry('isle', '--ses-yok')['kartlar'][0]
@@ -1620,6 +1638,9 @@ MARKER = 'MARKER.txt'
 class YakalaWindowsCommandUnitTest(unittest.TestCase):
     """Pure command-building rules in _windows_safe_command; no child process is spawned."""
 
+    def setUp(self):
+        public_dns_fixture(self)
+
     def test_unsafe_is_oserror_so_callers_fall_back(self):
         # via_defuddle/via_subtitles/via_audio already catch OSError and take the fallback path.
         self.assertTrue(issubclass(yakala._UnsafeBatchArgument, OSError))
@@ -1676,6 +1697,7 @@ class YakalaWindowsRunTest(unittest.TestCase):
     is truncated at the first metacharacter; with the fix cmd.exe is never reached."""
 
     def setUp(self):
+        public_dns_fixture(self)
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-winrun-')
         self.addCleanup(self.tmp.cleanup)
         self.work = Path(self.tmp.name)

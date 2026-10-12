@@ -112,6 +112,35 @@ class YakalaSecurityTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             yakala.via_stdlib('http://127.0.0.1/')
 
+    def test_helpers_reject_private_initial_dns_before_any_subprocess(self):
+        calls = ((yakala.via_defuddle, ('https://example.com/x', {'npx': 'npx'})),
+                 (yakala.youtube_tracks, ('https://example.com/x', {'yt_dlp': 'yt-dlp'}, self.root)),
+                 (yakala.via_audio, ('https://example.com/x', {'yt_dlp': 'yt-dlp', 'whisper': 'whisper'}, self.root)))
+        for address in ('127.0.0.1', '10.1.2.3', '169.254.169.254', '::1'):
+            with patch.object(socket, 'getaddrinfo', return_value=[
+                    (socket.AF_INET, socket.SOCK_STREAM, 6, '', (address, 443))]), \
+                    patch.object(yakala, '_run', side_effect=AssertionError('helper was invoked')):
+                for function, args in calls:
+                    with self.subTest(address=address, function=function.__name__), self.assertRaises(ValueError):
+                        function(*args)
+
+    def test_missing_helpers_do_not_resolve_dns(self):
+        with patch.object(socket, 'getaddrinfo', side_effect=AssertionError('no helper, no DNS')):
+            self.assertIsNone(yakala.via_defuddle('https://example.com/x', self.no_tools))
+            self.assertIsNone(yakala.youtube_tracks('https://example.com/x', self.no_tools, self.root))
+            self.assertIsNone(yakala.via_audio('https://example.com/x', self.no_tools, self.root))
+
+    def test_resolver_failure_is_a_card_error_and_queue_keeps_processing(self):
+        page = yakala.capture(self.vault, url='https://example.com/page')
+        note = yakala.capture(self.vault, text='Bağımsız not')
+        with patch.object(socket, 'getaddrinfo', side_effect=socket.gaierror('temporary failure')), \
+                patch.object(yakala, 'tools', return_value=dict(self.no_tools, npx='npx')), \
+                patch.object(yakala, '_run', side_effect=AssertionError('helper was invoked')):
+            result = yakala.process(self.vault, [page['id'], note['id']])['kartlar']
+        self.assertEqual(result[0]['durum'], 'hata')
+        self.assertIn('DNS adresi cozumlenemedi', result[0]['not'])
+        self.assertEqual(result[1]['durum'], 'cikarildi')
+
     def test_real_http_redirect_never_fetches_local_target(self):
         import urllib.request
         seen = []
