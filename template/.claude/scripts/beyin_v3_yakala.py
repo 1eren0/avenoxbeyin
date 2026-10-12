@@ -921,7 +921,7 @@ def windows_context():
             kernel32.CloseHandle(process)
         context = {'uygulama': name, 'pencere': buffer.value}
         if name and name.lower() in WIN_CHROMIUM:
-            url = windows_browser_url(window)
+            url = windows_browser_url(window, name)
             if url:
                 context['url'] = url
                 context['baslik'] = re.sub(r'\s+[-–—]\s+[^-–—]+$', '', buffer.value).strip() or None
@@ -930,7 +930,14 @@ def windows_context():
         return {}
 
 
-WIN_CHROMIUM = {'chrome', 'brave', 'msedge', 'vivaldi', 'opera', 'opera_gx', 'chromium', 'arc'}
+# Process name -> the UIA class of its address bar. Chromium names its omnibox view; Brave subclasses
+# it. Matching that class, not "the first Edit", keeps a text field inside the page from being read
+# as the address, and asking for one class only stops the search at the toolbar.
+WIN_CHROMIUM = {'chrome': 'OmniboxViewViews', 'msedge': 'OmniboxViewViews', 'chromium': 'OmniboxViewViews',
+                'brave': 'BraveOmniboxViewViews'}
+ADDRESS_TIMEOUT = 1.0  # seconds; a cold first read takes ~0.5 s, a hung browser must not hold the listener longer
+
+
 def _com_call(obj, index, *args, argtypes=()):
     """Call slot `index` of a COM interface's vtable (IUnknown takes 0-2)."""
     import ctypes
@@ -938,8 +945,8 @@ def _com_call(obj, index, *args, argtypes=()):
     return ctypes.WINFUNCTYPE(ctypes.HRESULT, ctypes.c_void_p, *argtypes)(vtable[index])(obj, *args)
 
 
-def _uia_address_bar(window):
-    """Text of the first Edit control under `window`, via IUIAutomation in-process (no PowerShell, ~20-100 ms)."""
+def _uia_address_bar(window, class_name):
+    """Text of the control of `class_name` under `window`, via IUIAutomation in-process (no PowerShell)."""
     import ctypes
     import uuid
     from ctypes import wintypes
@@ -956,26 +963,42 @@ def _uia_address_bar(window):
         return GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
 
     out = ctypes.POINTER(ctypes.c_void_p)
-    ctypes.windll.ole32.CoInitializeEx(None, 2)  # S_FALSE on a thread that already has COM is fine
-    uia, element, condition, found = (ctypes.c_void_p() for _ in range(4))
+    oleaut32 = ctypes.windll.oleaut32
+    oleaut32.SysAllocString.restype = ctypes.c_void_p
+    oleaut32.SysAllocString.argtypes = [ctypes.c_wchar_p]
+    oleaut32.VariantClear.argtypes = [ctypes.c_void_p]
+    started = ctypes.windll.ole32.CoInitializeEx(None, 2)  # S_OK and S_FALSE both need CoUninitialize
+    uia, element = ctypes.c_void_p(), ctypes.c_void_p()
     try:
         ctypes.oledll.ole32.CoCreateInstance(ctypes.byref(guid('ff48dba4-60ef-4201-aa87-54103eef594e')), None, 1,
                                              ctypes.byref(guid('30cbe57d-d9d0-452a-ab13-7ac5ac4825ee')), ctypes.byref(uia))
         _com_call(uia, 6, wintypes.HWND(window), ctypes.byref(element), argtypes=(wintypes.HWND, out))  # ElementFromHandle
-        edit = VARIANT(vt=3, v1=50004)  # VT_I4, UIA_EditControlTypeId
-        _com_call(uia, 23, 30003, edit, ctypes.byref(condition), argtypes=(ctypes.c_int, VARIANT, out))  # CreatePropertyCondition
-        _com_call(element, 5, 4, condition, ctypes.byref(found), argtypes=(ctypes.c_int, ctypes.c_void_p, out))  # FindFirst, descendants
-        if not found:
-            return None
-        value = VARIANT()
-        _com_call(found, 10, 30045, ctypes.byref(value), argtypes=(ctypes.c_int, ctypes.POINTER(VARIANT)))  # ValueValue
-        text = ctypes.wstring_at(value.v1) if value.vt == 8 and value.v1 else None  # VT_BSTR
-        ctypes.windll.oleaut32.VariantClear(ctypes.byref(value))
-        return text
+        condition, found = ctypes.c_void_p(), ctypes.c_void_p()
+        wanted = VARIANT(vt=8, v1=oleaut32.SysAllocString(class_name))  # VT_BSTR
+        try:
+            _com_call(uia, 23, 30012, wanted, ctypes.byref(condition),  # CreatePropertyCondition, ClassName
+                      argtypes=(ctypes.c_int, VARIANT, out))
+            _com_call(element, 5, 4, condition, ctypes.byref(found),  # FindFirst, descendants
+                      argtypes=(ctypes.c_int, ctypes.c_void_p, out))
+            if not found:
+                return None
+            value = VARIANT()
+            _com_call(found, 10, 30045, ctypes.byref(value),  # GetCurrentPropertyValue, Value
+                      argtypes=(ctypes.c_int, ctypes.POINTER(VARIANT)))
+            text = ctypes.wstring_at(value.v1) if value.vt == 8 and value.v1 else None
+            oleaut32.VariantClear(ctypes.byref(value))
+            return text
+        finally:
+            oleaut32.VariantClear(ctypes.byref(wanted))
+            for obj in (found, condition):
+                if obj:
+                    _com_call(obj, 2)  # Release
     finally:
-        for obj in (found, condition, element, uia):
+        for obj in (element, uia):
             if obj:
-                _com_call(obj, 2)  # Release
+                _com_call(obj, 2)
+        if started >= 0:
+            ctypes.windll.ole32.CoUninitialize()
 
 
 def tab_url(value):
@@ -992,12 +1015,33 @@ def tab_url(value):
     return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
 
 
-def windows_browser_url(window):
-    """Active tab URL of a Chromium browser, read from its address bar; None falls back to the clipboard."""
-    try:
-        return tab_url(_uia_address_bar(window))
-    except Exception:
+def windows_browser_url(window, app, timeout=ADDRESS_TIMEOUT):
+    """Active tab URL of a Chromium browser, read from its omnibox; None falls back to the clipboard.
+
+    The read runs on its own thread with its own COM apartment, so a hung or slow browser costs
+    at most `timeout` and the listener keeps answering the key.
+    """
+    import threading
+    class_name = WIN_CHROMIUM.get((app or '').lower())
+    if not class_name:
         return None
+    try:
+        import ctypes
+        if ctypes.windll.user32.IsHungAppWindow(window):
+            return None
+    except Exception:
+        pass
+    found = {}
+
+    def read():
+        try:
+            found['value'] = _uia_address_bar(window, class_name)
+        except Exception:
+            pass
+    worker = threading.Thread(target=read, name='yakala-adres', daemon=True)
+    worker.start()
+    worker.join(timeout)
+    return None if worker.is_alive() else tab_url(found.get('value'))
 
 
 def _try(command, timeout=5):

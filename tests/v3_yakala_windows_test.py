@@ -172,7 +172,7 @@ class JsonTextTest(unittest.TestCase):
 
 
 class BrowserUrlTest(unittest.TestCase):
-    """The active tab's link comes from the Chromium address bar; anything else is not a link."""
+    """The active tab's link comes from the browser's own address bar; anything else is not a link."""
 
     def test_address_bar_values(self):
         self.assertEqual(yakala.tab_url('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
@@ -181,17 +181,50 @@ class BrowserUrlTest(unittest.TestCase):
         for value in ('yarim kalmis arama', 'brave://settings', 'localhost', '', None):
             self.assertIsNone(yakala.tab_url(value), value)
 
+    def test_each_browser_is_asked_for_its_own_address_bar_class(self):
+        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai') as read:
+            self.assertEqual(yakala.windows_browser_url(42, 'Brave'), 'https://github.com/avenoxai')
+            self.assertEqual(yakala.windows_browser_url(42, 'msedge'), 'https://github.com/avenoxai')
+            self.assertIsNone(yakala.windows_browser_url(42, 'firefox'))
+        self.assertEqual([c.args for c in read.call_args_list], [(42, 'BraveOmniboxViewViews'), (42, 'OmniboxViewViews')])
+
     def test_reader_failure_falls_back_to_the_clipboard(self):
         with patch.object(yakala, '_uia_address_bar', side_effect=OSError('UI Automation yok')):
-            self.assertIsNone(yakala.windows_browser_url(42))
-        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai') as read:
-            self.assertEqual(yakala.windows_browser_url(42), 'https://github.com/avenoxai')
-        read.assert_called_once_with(42)
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
+        with patch.object(yakala, '_uia_address_bar', return_value=None):
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))  # no omnibox found
+
+    def test_a_slow_browser_costs_at_most_the_timeout(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(yakala, '_uia_address_bar', side_effect=lambda *_: release.wait(10) and 'late.example.com'):
+            started = time.monotonic()
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
+            self.assertLess(time.monotonic() - started, 2)
+
+    @unittest.skipUnless(WINDOWS, 'IsHungAppWindow is Windows only')
+    def test_a_hung_window_is_not_asked_at_all(self):
+        with patch.object(ctypes.windll.user32, 'IsHungAppWindow', return_value=1), \
+                patch.object(yakala, '_uia_address_bar') as read:
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
+        read.assert_not_called()
 
     @unittest.skipUnless(WINDOWS, 'UI Automation is Windows only')
-    def test_real_ui_automation_with_a_dead_window_gives_nothing(self):
+    def test_real_ui_automation_with_a_dead_window_gives_nothing_and_releases_com(self):
         # The real COM path end to end: ElementFromHandle fails on a closed handle and nothing escapes.
-        self.assertIsNone(yakala.windows_browser_url(0))
+        self.assertIsNone(yakala.windows_browser_url(0, 'chrome'))
+        seen = {}
+
+        def run():
+            with self.assertRaises(OSError):
+                yakala._uia_address_bar(0, 'OmniboxViewViews')
+            # Balanced: COM is not left initialised on the thread, so this is a fresh S_OK, not S_FALSE.
+            seen['again'] = ctypes.windll.ole32.CoInitializeEx(None, 2)
+            ctypes.windll.ole32.CoUninitialize()
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join(10)
+        self.assertEqual(seen.get('again'), 0)
 
 
 class FakeSession:
@@ -796,8 +829,9 @@ class WindowsListenerTest(unittest.TestCase):
         self.assertEqual(result, {'code': 0})
         argv = spawn.call_args.args[0]
         self.assertEqual(argv[1:5], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve())])
-        # The same two facts the window gathered for itself when the Start menu shortcut opened it.
-        self.assertLessEqual(set(json.loads(argv[argv.index('--baglam') + 1])), {'pencere', 'uygulama'})
+        # The facts the window gathered for itself when the Start menu shortcut opened it; with a
+        # Chromium browser in front, also its tab's link and title.
+        self.assertLessEqual(set(json.loads(argv[argv.index('--baglam') + 1])), {'pencere', 'uygulama', 'url', 'baslik'})
 
     def test_shortcut_content_and_clean_rewrite(self):
         link = self.root / 'kısayollar' / 'Beyne At Dinleyici deneme.lnk'
