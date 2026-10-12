@@ -21,7 +21,7 @@ if _MODULE_DIR not in sys.path:
 from beyin_v3 import (HARNESSES, REJECTED_AT, RETIRED_STATUSES, MemoryStore, ReceiptConflict, RevisionConflict, _json,
                       _path_redirected, _rejected_inference, _status_word, rejected_dependents, resolve_supersedes)
 from beyin_v3_index import applied_keys, dir_key, exclusions as index_exclusions, prune as prune_excluded
-from beyin_v3_hygiene import sensitive_excluded
+from beyin_v3_hygiene import sensitive_excluded, sensitive_source
 from beyin_v3_projections import project_receipts
 from beyin_v3_preferences import read as read_preferences
 from beyin_v3_secrets import redact as redact_secrets, record as record_redactions
@@ -956,6 +956,8 @@ class SyncEngine:
     def _refuse_excluded(self, source):
         """A new source under a directory the user keeps out of the index would be written and
         then fail its read-back; refuse it before anything is written, naming the setting."""
+        if sensitive_source(source):
+            raise ValueError('source is under a sensitive directory excluded from the memory index')
         excluded = index_exclusions(self.state, self.root)[0]
         if excluded and any(dir_key(part) in excluded for part in Path(source).parts[:-1]):
             raise ValueError('source is under a directory excluded from the index (excluded_dirs in index.json)')

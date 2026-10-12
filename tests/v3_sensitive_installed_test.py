@@ -64,12 +64,33 @@ engine.store.close()
         before = (snapshot(self.vault), snapshot(self.state))
         result = self.cli('context', 'Quartz rollout', '--no-sync')
         self.assertEqual([r['source'] for r in result['records']], ['notes/safe.md'])
+        source_snapshot = '''import sys, json
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / '.claude/scripts'))
+from beyin_v3 import MemoryStore
+store = MemoryStore(sys.argv[2], sys.argv[1], read_only=True)
+print(json.dumps(store.source_snapshot(['hidden.md'])))
+store.close()
+'''
+        result = subprocess.run([sys.executable, '-c', source_snapshot, str(self.vault), str(self.state)],
+                                capture_output=True, env=self.env, timeout=40)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['records'], [])
         self.cli('doctor')
         self.assertEqual((snapshot(self.vault), snapshot(self.state)), before)
         # Read-only delivery does not silently delete the legacy rows.
         with sqlite3.connect(self.state / 'memory.sqlite3') as db:
             sources = [json.loads(row[0])['source'] for row in db.execute('SELECT payload FROM records')]
             self.assertTrue(all(source in sources for source in self.sources))
+
+    def test_sensitive_note_create_refuses_before_it_writes_a_source(self):
+        path = self.vault / 'notes/Özel/new.md'
+        before = (snapshot(self.vault), snapshot(self.state))
+        payload = dict(source='notes/Özel/new.md', text='Quartz rollout new private note')
+        result = run_python(self.vault / 'beyin.py', ['note-create', '--file', '-'], self.vault, self.env, payload)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(path.exists())
+        self.assertEqual((snapshot(self.vault), snapshot(self.state)), before)
 
     def test_installed_sync_removes_sensitive_rows_and_preserves_source_files(self):
         result = self.cli('sync')

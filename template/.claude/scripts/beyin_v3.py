@@ -765,7 +765,10 @@ class MemoryStore:
             records = [json.loads(row[0]) for row in db.execute(query, params)]
         candidates = {name: [] for name in source_names}
         stale_count = 0
+        from beyin_v3_hygiene import sensitive_source
         for record in records:
+            if sensitive_source(record.get("source")):
+                continue
             if (record.get("visibility") not in allowed or record.get("trust") == "untrusted" or
                     record.get("trusted") is False or record.get("status") == "untrusted" or
                     record.get("kind") == "untrusted" or _rejected_inference(record)):
