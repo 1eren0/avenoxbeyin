@@ -176,10 +176,14 @@ class BrowserUrlTest(unittest.TestCase):
 
     def test_address_bar_values(self):
         self.assertEqual(yakala.tab_url('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
-        self.assertEqual(yakala.tab_url('http://127.0.0.1:8080/x'), 'http://127.0.0.1:8080/x')
+        self.assertIsNone(yakala.tab_url('http://127.0.0.1:8080/x'))
         self.assertEqual(yakala.tab_url('https://github.com/avenoxai'), 'https://github.com/avenoxai')
-        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', 'https://[broken/', 'https://example.com:bad/', '', None):
+        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', 'http://10.0.0.1/', 'https://user:pass@example.com/', 'https://[broken/', 'https://example.com:bad/', '', None):
             self.assertIsNone(yakala.tab_url(value), value)
+
+    def test_a_private_browser_tab_does_not_override_clipboard_capture(self):
+        with patch.object(yakala, '_uia_address_bar', return_value='http://127.0.0.1:8080/panel'):
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
 
     def test_each_browser_is_asked_for_its_own_address_bar_class(self):
         with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai') as read:

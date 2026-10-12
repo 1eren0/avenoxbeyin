@@ -1094,9 +1094,7 @@ def tab_url(value):
     if not re.match(r'[a-z][a-z0-9+.-]*://', value, re.I):
         value = 'https://' + value
     try:
-        parsed = urlparse(value)
-        parsed.port  # malformed port/IPv6 input falls back to the clipboard
-        return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
+        return _safe_source_url(value)  # the same boundary as capture; unsafe tabs keep clipboard capture available
     except ValueError:
         return None
 
