@@ -63,7 +63,7 @@ def prune(store, now=None):
     """
     now = time.time() if now is None else now
     done = store.state_dir / "hook-done"
-    if not done.is_dir():
+    if done.is_symlink() or not done.is_dir():
         return 0
     batch = []
     with store._connect() as db:
@@ -117,11 +117,16 @@ def summary(state, harnesses):
     """
     observed = {harness: set() for harness in harnesses}
     paths = []
-    for path in (Path(state) / "hook-done").glob("*.json"):
+    done = Path(state) / "hook-done"
+    for path in (() if done.is_symlink() else done.glob("*.json")):
         try:
+            if path.is_symlink() or path.stat().st_size > MAX_EVENT_BYTES:
+                continue
             event = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            continue  # Cleanup committed its ledger row before removing this marker.
+            if not isinstance(event, dict):
+                continue
+        except (OSError, ValueError, UnicodeError):
+            continue  # Corrupt, outside, or concurrently removed markers are not acknowledgements.
         paths.append(path)
         if event.get("harness") in observed:
             observed[event["harness"]].add(event.get("event", "unknown"))

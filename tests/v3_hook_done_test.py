@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """#304: bounded hook acknowledgements, durable dedupe and doctor migration."""
 import hashlib
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -23,7 +24,7 @@ class HookDoneLedgerTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="v3-hook-done-")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.vault = self.root / "vault"
         self.vault.mkdir()
         self.state = self.root / "state"
@@ -44,7 +45,7 @@ class HookDoneLedgerTest(unittest.TestCase):
 
     def test_lazy_migration_and_deduplication(self):
         key, old = self.marker("legacy", event="SessionStart")
-        with sqlite3.connect(self.store.database) as db:
+        with closing(sqlite3.connect(self.store.database)) as db:
             self.assertFalse(db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='hook_done_ledger'"
             ).fetchone())
@@ -58,7 +59,7 @@ class HookDoneLedgerTest(unittest.TestCase):
         self.assertEqual(report["lifecycle"]["claude"], {
             "status": "observed_metadata", "events": ["SessionStart"]})
         self.assertEqual(report["lifecycle"]["codex"]["status"], "never_seen")
-        with sqlite3.connect(self.store.database) as db:
+        with closing(sqlite3.connect(self.store.database)) as db:
             row = db.execute("SELECT key,harness,event FROM hook_done_ledger").fetchone()
         self.assertEqual(row, (key, "claude", "SessionStart"))
         self.assertNotIn("private-session", str(row))
@@ -147,6 +148,19 @@ class HookDoneLedgerTest(unittest.TestCase):
         self.assertTrue(external.exists())
         if link is not None:
             self.assertTrue(link.is_symlink())
+
+    def test_symlinked_archive_directory_is_not_pruned(self):
+        external = self.root / 'external-done'
+        self.done.rename(external)
+        try:
+            self.done.symlink_to(external, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            external.rename(self.done)
+            self.skipTest('symlink unavailable')
+        _key, old = self.marker('external-history')
+        before = old.read_bytes()
+        self.assertEqual(ledger.prune(self.store), 0)
+        self.assertEqual(old.read_bytes(), before)
 
     def test_queue_ignores_archived_event_key(self):
         identity = "durable-ack-event"
