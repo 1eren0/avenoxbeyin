@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -334,7 +335,8 @@ class YakalaUnitTest(unittest.TestCase):
         clipped.write_text('---\ntur: yakala\ndurum: bekliyor\nkaynak_turu: makale\nurl: "https://ornek.com/yazi"\n---\n\n'
                            '# Yazı\n\n## Neden\n\n\n\n## Icerik\n\n' + ('Uzun makale metni. ' * 30) + '\n', encoding='utf-8')
         video = yakala.capture(self.vault, url='https://www.youtube.com/watch?v=zzz')
-        with patch.object(yakala, 'tools', return_value=none):
+        with patch.object(yakala, 'tools', return_value=none), patch.object(socket, 'getaddrinfo', return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))]):
             result = yakala.process(self.vault)
         by_id = {entry['id']: entry for entry in result['kartlar']}
         self.assertEqual(by_id[note['id']]['yontem'], 'metin')
@@ -370,7 +372,8 @@ class YakalaUnitTest(unittest.TestCase):
     def test_repair_mojibake(self):
         good = 'Agent loop’ta en pahalı şey bağlam kaybı'
         self.assertEqual(yakala.repair_mojibake(good.encode('utf-8').decode('mac_roman')), good)
-        self.assertEqual(yakala.repair_mojibake('pahalÄ± ÅŸey'), 'pahalı şey')  # cp1252 variant
+        self.assertEqual(yakala.repair_mojibake('pahalı şey'.encode('utf-8').decode('cp1252')),
+                         'pahalı şey')  # same corrupted input, generated without broken source text
         for text in ('Müşteri Şifre Arşiv', 'café', 'plain'):
             self.assertEqual(yakala.repair_mojibake(text), text)
 
@@ -1214,6 +1217,11 @@ class YakalaVideoLanguageTest(unittest.TestCase):
     and warns only on evidence of a wrong one (a known mismatch, or a dubbed video of unknown language)."""
 
     def setUp(self):
+        # Helpers are fixture subprocesses, so DNS must be a public fixture answer too.
+        dns = patch.object(socket, 'getaddrinfo', return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 443))])
+        dns.start()
+        self.addCleanup(dns.stop)
         self.tmp = tempfile.TemporaryDirectory(prefix='v3-yakala-dil-')
         self.addCleanup(self.tmp.cleanup)
         self.vault, self.bin = Path(self.tmp.name) / 'Örnek Beyin', Path(self.tmp.name) / 'bin'
@@ -1497,6 +1505,11 @@ class YakalaInstalledTest(unittest.TestCase):
                                       + ' "$@"\n', encoding='utf-8')
             (tools / name).chmod(0o755)
         self.env['PATH'] = isolated_path(tools)
+        (tools / 'sitecustomize.py').write_text(
+            "import socket\n"
+            "socket.getaddrinfo = lambda host, port, *args, **kwargs: "
+            "[(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', port))]\n", encoding='utf-8')
+        self.env['PYTHONPATH'] = str(tools)  # the installed child uses fixture DNS, just like fixture helpers
         added = self.entry('ekle', VIDEO, '--neden', 'dublaj')
         entry = self.entry('isle', '--ses-yok')['kartlar'][0]
         self.assertEqual((entry['durum'], entry.get('yontem'), entry.get('dil')), ('cikarildi', 'yt-dlp-altyazi', 'en'))

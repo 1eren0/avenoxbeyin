@@ -26,6 +26,12 @@ Kısayol ek paket istemez; Python'un kendisiyle çalışır. Mac'te bir oturum a
 (LaunchAgent), Windows'ta oturum açılışında başlayan küçük bir dinleyici tuşu dinler.
 Yalnız şablon ve skill istiyorsan: `python3 beyin.py yakala kur --kisayol-yok`.
 
+**Mevcut kurulum:** [#299 güvenlik güncellemesini](YAKALA-GUVENLIK-299.md) aldıktan sonra
+vault klasöründe `python3 beyin.py yakala kur` komutunu bir kez yeniden çalıştır
+(Windows'ta `py -3 beyin.py yakala kur`). Böylece daha önce yazılmış `beyin-yakala` skill'i
+yeni güvenilmeyen içerik ve rastgele sınır kurallarını alır. Yalnız şablon/skill kullanıyorsan
+`--kisayol-yok` ekle; kullanıcının kendi işaretsiz skill'i korunur.
+
 ### Linux
 
 Linux'ta arka planda dinleyen bir servis yok; kısayol masaüstünün kendi kısayol ayarına yazılır.
