@@ -33,6 +33,7 @@ MAC_HOTKEY = 'Control+Option+B'  # Option+Command+B is the bookmarks key in Chro
 WIN_HOTKEY = 'CTRL+ALT+B'
 STATUSES = ('bekliyor', 'cikarildi', 'islendi', 'hata')
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+BELOW_NORMAL = getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0)
 
 
 # ---------------------------------------------------------------- cards
@@ -1042,15 +1043,26 @@ def _round_rect(canvas, x1, y1, x2, y2, radius, **options):
     return canvas.create_polygon(points, smooth=True, splinesteps=24, **options)
 
 
+_FONTS = {}
+
+
 def _fit(canvas, text, font, width):
     """Trim with an ellipsis so the text fits `width` pixels in `font`."""
     import tkinter.font as tkfont
-    measure = tkfont.Font(root=canvas, font=font).measure
+    key = (str(canvas.winfo_toplevel()), font)
+    if key not in _FONTS:  # building a Font is the expensive part; one per window and description
+        _FONTS[key] = tkfont.Font(root=canvas, font=font)
+    measure = _FONTS[key].measure
     if measure(text) <= width:
         return text
-    while text and measure(text + '…') > width:
-        text = text[:-1]
-    return text.rstrip() + '…'
+    low, high = 0, len(text)  # longest prefix that fits with the ellipsis
+    while low < high:
+        middle = (low + high + 1) // 2
+        if measure(text[:middle] + '…') <= width:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + '…'
 
 
 # Clipboard image (#274), Windows only for now. After Win+Shift+S the clipboard holds the picture and a
@@ -1398,16 +1410,20 @@ def _hotkey_hint(vault, state=None):
     return (label + ' ile her yerden açılır') if label else 'İkinci beynine kaydedilir'
 
 
-def popup(vault, context=None, state=None):
-    """Command-palette window: what will be saved, one line for why, Enter saves, Esc closes."""
+def popup(vault, context=None, state=None, root=None):
+    """Command-palette window: what will be saved, one line for why, Enter saves, Esc closes.
+
+    `root` is a Tk that a warm window already built while it waited for the key (Windows).
+    """
     context = dict(context or {})
     try:
         import tkinter as tk
     except ImportError:
         return _popup_fallback(vault, context, state)
     snapshot = os.environ.get('BEYIN_YAKALA_SNAPSHOT')
-    root = tk.Tk()
-    root.withdraw()
+    if root is None:
+        root = tk.Tk()
+        root.withdraw()
     clip = _clipboard(root).strip()
     image = clipboard_image(clip, context)  # Windows: a picture on the clipboard (#274); None changes nothing
     if image:
@@ -1419,11 +1435,7 @@ def popup(vault, context=None, state=None):
     include = {'on': bool(clip_text) and not url and not files}
 
     P, W, pad = PALETTE, 640, 26
-    root.title('Beyne at')
-    root.configure(bg=P['bg'])
-    root.resizable(False, False)
-    if os.name == 'nt':
-        root.overrideredirect(True)
+    _window_chrome(root)
     canvas = tk.Canvas(root, width=W, highlightthickness=0, bd=0, bg=P['bg'])
     canvas.pack(fill='both', expand=True)
 
@@ -1565,7 +1577,7 @@ def popup(vault, context=None, state=None):
             except tk.TclError:
                 root.destroy()
                 return
-            root.after(16, fade, round(alpha - 0.12, 2))
+            root.after(10, fade, round(alpha - 0.34, 2))
         fade(1.0)
 
     def save(_event=None):
@@ -1584,7 +1596,7 @@ def popup(vault, context=None, state=None):
             return 'break'
         entry.configure(state='disabled', disabledbackground=P['bg'], disabledforeground=P['muted'])
         canvas.itemconfigure(status, text='✓  Beyne atıldı', fill=P['ok'], font=_font(12, 'bold'))
-        root.after(520, close)
+        root.after(260, close)
         return 'break'
 
     root.bind('<Return>', save)
@@ -1609,13 +1621,13 @@ def popup(vault, context=None, state=None):
         entry.focus_set()
 
     def fade_in(alpha=0.0):
-        alpha = min(1.0, alpha + 0.2)
+        alpha = min(1.0, alpha + 0.5)  # two frames: a hint of motion, not a wait
         try:
             root.attributes('-alpha', alpha)
         except tk.TclError:
             return
         if alpha < 1.0:
-            root.after(14, fade_in, alpha)
+            root.after(10, fade_in, alpha)
     fade_in()
     if snapshot and sys.platform == 'darwin':
         # Development aid: capture only this window's rectangle without taking focus, then close.
@@ -1661,6 +1673,41 @@ def _linux_ask(shown=''):
         raise ValueError(LINUX_NO_WINDOW)
     code, out = _try(command, timeout=300)
     return out.strip() if code == 0 else None
+
+
+def _window_chrome(root):
+    """Title, background and frame: fixed for every capture, and these wm calls cost ~90 ms on Windows."""
+    if getattr(root, '_chrome', False):
+        return
+    root.title('Beyne at')
+    root.configure(bg=PALETTE['bg'])
+    root.resizable(False, False)
+    if os.name == 'nt':
+        root.overrideredirect(True)
+    root._chrome = True
+
+
+def warm_popup(vault, state=None):
+    """Windows: pay for Python, this module, Tk and the frame before the key, then wait for the context line.
+
+    The listener keeps one of these ready and writes the context to its stdin when the key is
+    pressed; a closed pipe (the listener stopped) ends it without a window.
+    """
+    import tkinter as tk
+    root = tk.Tk()
+    root.withdraw()
+    _window_chrome(root)
+    root.update_idletasks()
+    line = sys.stdin.buffer.readline() if sys.stdin else b''
+    if not line.strip():
+        root.destroy()
+        return {'status': 'vazgecildi'}
+    try:  # it waited at below-normal priority so it never slowed a window on screen; now it is that window
+        import ctypes
+        ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), 0x20)  # NORMAL
+    except Exception:
+        pass
+    return popup(vault, json.loads(line.decode('utf-8')), state, root=root)
 
 
 def _popup_fallback(vault, context, state=None):
@@ -1992,23 +2039,42 @@ def listen_windows(vault, script, spec=None, state=None):
         _listener_log(state, reason)
         raise SystemExit(reason)
 
+    warm = {'child': None}
+
+    def window_command(*extra):
+        # Prefer the vault copy so an update reaches the window without reinstalling the listener.
+        current = vault_path / '.claude/scripts' / Path(script).name
+        target = current if current.is_file() else Path(script).resolve()
+        pythonw = Path(sys.executable).with_name('pythonw.exe')
+        exe = str(pythonw if pythonw.is_file() else sys.executable)
+        return [exe, str(target), 'pencere', '--vault', str(vault_path)] + list(extra)
+
+    def prepare():
+        # One window waits for the next key, already past Python, the module, Tk and the frame (~0.5 s).
+        try:
+            warm['child'] = subprocess.Popen(window_command('--hazir'), stdin=subprocess.PIPE,
+                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                             creationflags=NO_WINDOW | BELOW_NORMAL)
+        except Exception:
+            warm['child'] = None
+
     def pressed():
         try:
             context = windows_context()
-            # Prefer the vault copy so an update reaches the window without reinstalling the listener.
-            current = vault_path / '.claude/scripts' / Path(script).name
-            target = current if current.is_file() else Path(script).resolve()
-            pythonw = Path(sys.executable).with_name('pythonw.exe')
-            exe = str(pythonw if pythonw.is_file() else sys.executable)
-            child = subprocess.Popen([exe, str(target), 'pencere', '--vault', str(vault_path),
-                                      '--baglam', json.dumps(context)],
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
+            child, warm['child'] = warm['child'], None
+            try:
+                child.stdin.write(json.dumps(context).encode('utf-8') + b'\n')
+                child.stdin.close()
+            except Exception:  # none ready, or it died: start one the old way
+                child = subprocess.Popen(window_command('--baglam', json.dumps(context)),
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
             # The key press gave this process the right to take the foreground; pass it on, or the
             # window can open behind the active application and the typing goes to that one.
             user32.AllowSetForegroundWindow(child.pid)
         except Exception:
             pass
+        prepare()
 
     # The stop event is also the session lock: the process that created it is the listener.
     ctypes.set_last_error(0)
@@ -2028,6 +2094,7 @@ def listen_windows(vault, script, spec=None, state=None):
         try:
             # Created only now, so `durum` and `kur` never see a listener whose key was refused.
             mutex = kernel32.CreateMutexW(None, False, _windows_mutex(vault_path))
+            prepare()
             handles = (wintypes.HANDLE * 1)(stop)
             msg = wintypes.MSG()
             while True:
@@ -2724,6 +2791,7 @@ def main(argv=None, vault=None, state=None):
     add.add_argument('--arac', default='komut')
     window = command_parser('pencere', help='Yakalama penceresini ac')
     window.add_argument('--baglam', help=argparse.SUPPRESS)
+    window.add_argument('--hazir', action='store_true', help=argparse.SUPPRESS)
     listen = command_parser('dinle', help=argparse.SUPPRESS)
     listen.add_argument('--keycode', type=int, default=11)
     listen.add_argument('--mods', type=int, default=0x1000 | 0x800)
@@ -2758,8 +2826,11 @@ def main(argv=None, vault=None, state=None):
     if command == 'pencere':
         if argv is None and sys.platform.startswith('linux'):
             _hand_over(vault, state)  # started by the hotkey from the state copy
-        context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
-        result = popup(vault, context, state)
+        if getattr(args, 'hazir', False):
+            result = warm_popup(vault, state)
+        else:
+            context = json.loads(args.baglam) if getattr(args, 'baglam', None) else gather_context()
+            result = popup(vault, context, state)
     elif command == 'dinle':
         if sys.platform == 'darwin':
             listen_mac(vault, Path(__file__).resolve(), args.keycode, args.mods)

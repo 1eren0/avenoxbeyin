@@ -329,6 +329,9 @@ class ListenerFlowTest(unittest.TestCase):
         return thread, result
 
     def test_registers_reports_opens_the_window_and_stops_by_name(self):
+        windows = [Mock(pid=4321), Mock(pid=4322)]
+        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=windows).start()
+        self.addCleanup(patch.stopall)
         thread, result = self.listen(self.vault)
         self.assertTrue(wait_until(lambda: yakala._windows_listener_running(self.vault), 10))
         self.assertEqual(list(self.session.hotkeys), [(0x4003, ord('B'))])
@@ -336,14 +339,21 @@ class ListenerFlowTest(unittest.TestCase):
         # The mutex `durum` reads exists only once the key is registered.
         order = [name for name, _detail in self.session.calls]
         self.assertLess(order.index('register'), order.index('create-mutex'))
+        # A window is already waiting before the first key, past Python, the module and Tk.
+        self.assertTrue(wait_until(lambda: spawn.call_count == 1, 10))
+        argv = spawn.call_args.args[0]
+        self.assertEqual(argv[1:], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve()), '--hazir'])
+        self.assertEqual(spawn.call_args.kwargs['stdin'], subprocess.PIPE)
         context = {'uygulama': 'chrome', 'pencere': 'Şifre & Müşteri'}
-        with patch.object(yakala, 'windows_context', return_value=context), \
-                patch.object(yakala.subprocess, 'Popen', return_value=Mock(pid=4321)) as spawn:
+        with patch.object(yakala, 'windows_context', return_value=context):
             self.session.press(0x4003, ord('B'))
             self.assertTrue(wait_until(lambda: ('foreground', 4321) in self.session.calls, 10))
-        argv = spawn.call_args.args[0]
-        self.assertEqual(argv[1:5], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve())])
-        self.assertEqual(json.loads(argv[argv.index('--baglam') + 1]), context)
+        # The key hands the context to the waiting window and readies the next one.
+        line = windows[0].stdin.write.call_args.args[0]
+        self.assertEqual(json.loads(line.decode('utf-8')), context)
+        self.assertTrue(line.endswith(b'\n') and windows[0].stdin.close.called)
+        self.assertTrue(wait_until(lambda: spawn.call_count == 2, 10))
+        self.assertIn('--hazir', spawn.call_args.args[0])
         yakala._windows_stop_listener(self.other, timeout=1)  # another vault's uninstall
         self.assertTrue(thread.is_alive() and yakala._windows_listener_running(self.vault))
         yakala._windows_stop_listener(self.vault, timeout=5)
@@ -351,6 +361,21 @@ class ListenerFlowTest(unittest.TestCase):
         self.assertEqual(result, {'code': 0})
         self.assertEqual((self.session.hotkeys, self.session.objects, self.session.handles), ({}, {}, {}))
         yakala._windows_stop_listener(self.vault, timeout=1)  # twice is harmless
+
+    def test_a_dead_waiting_window_falls_back_to_a_fresh_one(self):
+        dead, fresh, next_one = Mock(pid=1), Mock(pid=4321), Mock(pid=2)
+        dead.stdin.write.side_effect = BrokenPipeError
+        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=[dead, fresh, next_one]).start()
+        self.addCleanup(patch.stopall)
+        self.listen(self.vault)
+        self.assertTrue(wait_until(lambda: spawn.call_count == 1, 10))
+        context = {'uygulama': 'code', 'pencere': 'not'}
+        with patch.object(yakala, 'windows_context', return_value=context):
+            self.session.press(0x4003, ord('B'))
+            self.assertTrue(wait_until(lambda: ('foreground', 4321) in self.session.calls, 10))
+        argv = spawn.call_args_list[1].args[0]
+        self.assertEqual(json.loads(argv[argv.index('--baglam') + 1]), context)
+        self.assertTrue(wait_until(lambda: spawn.call_count == 3, 10))
 
     def test_a_taken_key_never_looks_like_a_running_listener(self):
         self.session.hotkeys[(0x4003, ord('B'))] = -1  # another application owns the combination
@@ -430,6 +455,11 @@ class WindowsEyes:
 class FakeListenerProcess:
     """`pythonw <copy> dinle --vault V --tus K` as install() starts it, run on a thread."""
     started = []
+
+    def __new__(cls, command, **options):
+        if 'dinle' not in command:  # the listener's waiting window: nothing to run here
+            return Mock(pid=4321, command=command)
+        return super().__new__(cls)
 
     def __init__(self, command, **options):
         self.command, self.options, self.code = command, options, None
@@ -760,21 +790,24 @@ class WindowsListenerTest(unittest.TestCase):
                 result['code'] = yakala.listen_windows(self.vault, MODULE, KEY, self.state)
             except SystemExit as exc:
                 result['code'] = exc.code
-        with patch.object(yakala.subprocess, 'Popen', return_value=Mock(pid=os.getpid())) as spawn:
+        waiting = Mock(pid=os.getpid())
+        with patch.object(yakala.subprocess, 'Popen', return_value=waiting) as spawn:
             thread = threading.Thread(target=run, daemon=True)
             thread.start()
             self.assertTrue(wait_until(lambda: yakala._windows_listener_running(self.vault) or not thread.is_alive()))
             self.assertTrue(thread.is_alive(), result)
+            self.assertTrue(wait_until(lambda: spawn.called, 30))
             # WM_HOTKEY as the system posts it to the registering thread; no synthetic key press needed.
             self.assertTrue(hotkey_user32().PostThreadMessageW(thread.native_id, 0x0312, 1, 0))
-            self.assertTrue(wait_until(lambda: spawn.called, 30))
+            self.assertTrue(wait_until(lambda: waiting.stdin.write.called, 30))
             yakala._windows_stop_listener(self.vault, timeout=30)
             thread.join(60)
         self.assertEqual(result, {'code': 0})
-        argv = spawn.call_args.args[0]
-        self.assertEqual(argv[1:5], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve())])
+        argv = spawn.call_args_list[0].args[0]
+        self.assertEqual(argv[1:], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve()), '--hazir'])
         # The same two facts the window gathered for itself when the Start menu shortcut opened it.
-        self.assertLessEqual(set(json.loads(argv[argv.index('--baglam') + 1])), {'pencere', 'uygulama'})
+        line = waiting.stdin.write.call_args_list[0].args[0]
+        self.assertLessEqual(set(json.loads(line.decode('utf-8'))), {'pencere', 'uygulama'})
 
     def test_shortcut_content_and_clean_rewrite(self):
         link = self.root / 'kısayollar' / 'Beyne At Dinleyici deneme.lnk'
