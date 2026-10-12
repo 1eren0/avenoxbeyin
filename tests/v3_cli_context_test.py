@@ -1,6 +1,8 @@
 """Context must refresh source state without lifecycle hooks."""
 from datetime import datetime, timezone
 import json
+import hashlib
+import sqlite3
 import os
 from pathlib import Path
 import shutil
@@ -45,6 +47,16 @@ class ContextRefreshTest(unittest.TestCase):
             target = checkout / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
+        # The standalone reader still enforces folder privacy on an older persisted row.
+        private = self.vault / 'notes/Özel/decision.md'
+        private.parent.mkdir()
+        private.write_text('synthetic calibration PRIVATE_CANARY', encoding='utf-8')
+        with sqlite3.connect(self.state / 'memory.sqlite3') as db:
+            payload = json.loads(db.execute('SELECT payload FROM records WHERE id=?', ('calibration',)).fetchone()[0])
+            payload.update(id='private-old-row', source='notes/Özel/decision.md',
+                           text=private.read_text(encoding='utf-8'),
+                           source_sha256=hashlib.sha256(private.read_bytes()).hexdigest())
+            db.execute('INSERT INTO records VALUES (?,?)', (payload['id'], json.dumps(payload)))
         before = snapshot(checkout), snapshot(self.vault), snapshot(self.state)
         env = inherited_env()
         env.pop('PYTHONDONTWRITEBYTECODE', None)

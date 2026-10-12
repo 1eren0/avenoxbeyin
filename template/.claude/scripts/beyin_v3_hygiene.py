@@ -34,6 +34,11 @@ import tempfile
 import time
 import unicodedata
 
+_MODULE_DIR = str(Path(__file__).resolve().parent)
+if _MODULE_DIR not in sys.path:
+    sys.path.insert(0, _MODULE_DIR)
+from beyin_v3 import SENSITIVE_WORDS, sensitive_fold as fold, sensitive_excluded, sensitive_source
+
 # Companion memory files grow by design and are compacted by the
 # companion-compact protocol, so they are fully exempt from every scan here
 # (#130 decision: tam muafiyet). A personalized companion directory name comes
@@ -82,11 +87,7 @@ SORU_SKIP_DIRS = re.compile(r'(?:daily|knowledge|receipts|tasks|notes|nodes|node
 # re.IGNORECASE does not fold Turkish İ/ı either, so the name is folded first.
 # Archives are not kasa-class: they are quiet by design, not private, and the
 # template ships "📦 900-Archive".
-SENSITIVE_WORDS = re.compile(
-    r'(?:kasa|sifre|parola|kimlik|kimlig|finans|finansal|musteri|vergi|fatura|maas|ozel|gizli|gizlilik)'
-    r'(?:ler|lar)?(?:i|im|in|imiz|leri|lari)?'
-    r'|(?:private|secret|password|credential)s?')
-_TR_FOLD = str.maketrans({'ş': 's', 'ğ': 'g', 'ü': 'u', 'ö': 'o', 'ç': 'c', 'ı': 'i', 'â': 'a', 'î': 'i', 'û': 'u'})
+
 TERMINAL_STATUSES = {'done', 'cancelled', 'kapandi'}
 # Directories a walk must never descend into: they are code, not notes.
 CODE_DIRS = {'node_modules', 'venv', '.venv', '__pycache__'}
@@ -98,10 +99,6 @@ FRONT = re.compile(r'\A---\r?\n.*?\r?\n---[ \t]*(?:\r?\n|\Z)', re.S)
 PATCH_PATHS = re.compile(r'(?m)^\*\*\* (?:Add File|Update File|Move to): (.+?)\s*$')
 
 
-def fold(name):
-    """NFC, Turkish-aware casefold and ASCII-fold a name: 'MÜŞTERİLER' and NFD 'Şifre' both fold."""
-    text = unicodedata.normalize('NFC', str(name)).replace('İ', 'i').replace('I', 'i').lower()
-    return unicodedata.normalize('NFC', text.replace('̇', '')).translate(_TR_FOLD)
 
 
 def _name_words(name):
@@ -112,14 +109,6 @@ def _nfc(name):
     return unicodedata.normalize('NFC', str(name))
 
 
-def sensitive_excluded(name):
-    """True when a directory name carries a kasa-class word (any position, any case/normal form)."""
-    return any(SENSITIVE_WORDS.fullmatch(word) for word in _name_words(name))
-
-
-def sensitive_source(source):
-    """A vault-relative source inside a sensitive folder must not enter the memory index or context."""
-    return isinstance(source, str) and any(sensitive_excluded(part) for part in Path(source).parts[:-1])
 
 
 def _archive(name):
