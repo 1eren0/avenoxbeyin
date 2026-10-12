@@ -233,3 +233,14 @@ beyin.py yakala kur [--kisayol-yok] [--tus 'ctrl+alt+b'] [--klasor "Notlar/Yakal
 beyin.py yakala kisayol ['cmd+"']
 beyin.py yakala kaldir | durum | sablon
 ```
+
+### Kaynak güvenliği
+
+Yakala kartı oluşturmak ağ kullanmaz. HTTP(S) kaynağını işlemeden önce yerel/özel IP adresleri,
+URL kullanıcı bilgileri ve bozuk adresler reddedilir. Defuddle ve yt-dlp'ye URL gönderilmeden önce
+DNS yanıtları da denetlenir; Python HTTP yolunun yönlendirmeleri aynı kapıdan geçer. DNS geçici
+olarak çözümlenemezse kart hata notuyla kalır, sıradaki kartlar işlenmeye devam eder.
+
+Bu denetimler ilk hedefteki özel adresleri engeller. Yardımcı araçların kendi yönlendirmeleri ve
+DNS rebinding için tam ağ izolasyonu sağlamaz. Ham kaynak metni güvenilmeyen veri olarak işaretlenir;
+metnin içindeki rol değişikliği, komut çalıştırma ve dosya silme istekleri talimat sayılmaz.

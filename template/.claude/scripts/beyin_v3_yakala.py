@@ -510,6 +510,7 @@ def via_defuddle(url, found, info=None, lang=None):
     _safe_source_url(url)
     if not found['npx']:
         return None
+    _safe_network_url(url)
     try:
         code, out, _ = _run([found['npx'], '-y', DEFUDDLE, 'parse', url, '--json', '--markdown']
                             + (['--lang', lang] if lang else []), timeout=180)
@@ -588,6 +589,7 @@ def youtube_tracks(url, found, workdir):
     _safe_source_url(url)
     if not found['yt_dlp']:
         return None
+    _safe_network_url(url)
     try:
         _, out, _ = _run([found['yt_dlp'], '--skip-download', '--no-playlist', '-J', url], timeout=180)
         data = json.loads(out)
@@ -639,6 +641,7 @@ def via_audio(url, found, workdir):
     _safe_source_url(url)
     if not (found['yt_dlp'] and found['whisper']):
         return None
+    _safe_network_url(url)
     audio = Path(workdir) / 'ses'
     try:
         _run([found['yt_dlp'], '-f', 'bestaudio/best', '--no-playlist', '-o', str(audio) + '.%(ext)s', url], timeout=900)
