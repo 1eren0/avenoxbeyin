@@ -178,7 +178,7 @@ class BrowserUrlTest(unittest.TestCase):
         self.assertEqual(yakala.tab_url('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
         self.assertEqual(yakala.tab_url('http://127.0.0.1:8080/x'), 'http://127.0.0.1:8080/x')
         self.assertEqual(yakala.tab_url('https://github.com/avenoxai'), 'https://github.com/avenoxai')
-        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', '', None):
+        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', 'https://[broken/', 'https://example.com:bad/', '', None):
             self.assertIsNone(yakala.tab_url(value), value)
 
     def test_each_browser_is_asked_for_its_own_address_bar_class(self):
@@ -195,12 +195,28 @@ class BrowserUrlTest(unittest.TestCase):
             self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))  # no omnibox found
 
     def test_a_slow_browser_costs_at_most_the_timeout(self):
-        release = threading.Event()
-        self.addCleanup(release.set)
-        with patch.object(yakala, '_uia_address_bar', side_effect=lambda *_: release.wait(10) and 'late.example.com'):
-            started = time.monotonic()
-            self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
-            self.assertLess(time.monotonic() - started, 2)
+        release, finished = threading.Event(), threading.Event()
+
+        def slow(*_):
+            release.wait(10)
+            finished.set()
+            return 'late.example.com'
+        with patch.object(yakala, '_uia_address_bar', side_effect=slow) as read:
+            try:
+                started = time.monotonic()
+                self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
+                self.assertLess(time.monotonic() - started, 2)
+                # A timed-out COM provider keeps only its original worker. Repeated hotkeys return
+                # immediately instead of leaking one daemon/apartment on every press.
+                for _ in range(10):
+                    self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
+                self.assertEqual(read.call_count, 1)
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(2))
+                self.assertTrue(wait_until(lambda: not any(t.name == 'yakala-adres' for t in threading.enumerate()), 2))
+        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai'):
+            self.assertEqual(yakala.windows_browser_url(42, 'chrome'), 'https://github.com/avenoxai')
 
     @unittest.skipUnless(WINDOWS, 'IsHungAppWindow is Windows only')
     def test_a_hung_window_is_not_asked_at_all(self):

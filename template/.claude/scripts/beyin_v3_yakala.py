@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -935,6 +936,7 @@ def windows_context():
 # as the address, and asking for one class only stops the search at the toolbar.
 WIN_CHROMIUM = {'chrome': 'OmniboxViewViews', 'msedge': 'OmniboxViewViews', 'chromium': 'OmniboxViewViews',
                 'brave': 'BraveOmniboxViewViews'}
+_ADDRESS_READER = threading.BoundedSemaphore(1)  # at most one outstanding COM read, even after its timeout
 ADDRESS_TIMEOUT = 1.0  # seconds; a cold first read takes ~0.5 s, a hung browser must not hold the listener longer
 
 
@@ -1011,8 +1013,12 @@ def tab_url(value):
         return None
     if not re.match(r'[a-z][a-z0-9+.-]*://', value, re.I):
         value = 'https://' + value
-    parsed = urlparse(value)
-    return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
+    try:
+        parsed = urlparse(value)
+        parsed.port  # malformed port/IPv6 input falls back to the clipboard
+        return value if parsed.scheme in ('http', 'https') and '.' in (parsed.hostname or '') else None
+    except ValueError:
+        return None
 
 
 def windows_browser_url(window, app, timeout=ADDRESS_TIMEOUT):
@@ -1031,6 +1037,8 @@ def windows_browser_url(window, app, timeout=ADDRESS_TIMEOUT):
             return None
     except Exception:
         pass
+    if not _ADDRESS_READER.acquire(blocking=False):
+        return None  # a timed-out provider is still answering; never pile up COM threads
     found = {}
 
     def read():
@@ -1038,8 +1046,14 @@ def windows_browser_url(window, app, timeout=ADDRESS_TIMEOUT):
             found['value'] = _uia_address_bar(window, class_name)
         except Exception:
             pass
+        finally:
+            _ADDRESS_READER.release()
     worker = threading.Thread(target=read, name='yakala-adres', daemon=True)
-    worker.start()
+    try:
+        worker.start()
+    except Exception:
+        _ADDRESS_READER.release()
+        return None
     worker.join(timeout)
     return None if worker.is_alive() else tab_url(found.get('value'))
 
