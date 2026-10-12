@@ -215,6 +215,82 @@ class WarmWindowTest(unittest.TestCase):
         self.assertEqual(child.wait(15), 0)
 
 
+class BrowserUrlTest(unittest.TestCase):
+    """The active tab's link comes from the browser's own address bar; anything else is not a link."""
+
+    def test_address_bar_values(self):
+        self.assertEqual(yakala.tab_url('youtube.com/watch?v=abc\r\n'), 'https://youtube.com/watch?v=abc')
+        self.assertIsNone(yakala.tab_url('http://127.0.0.1:8080/x'))
+        self.assertEqual(yakala.tab_url('https://github.com/avenoxai'), 'https://github.com/avenoxai')
+        for value in ('yarim kalmis arama', 'brave://settings', 'localhost', 'http://10.0.0.1/', 'https://user:pass@example.com/', 'https://[broken/', 'https://example.com:bad/', '', None):
+            self.assertIsNone(yakala.tab_url(value), value)
+
+    def test_a_private_browser_tab_does_not_override_clipboard_capture(self):
+        with patch.object(yakala, '_uia_address_bar', return_value='http://127.0.0.1:8080/panel'):
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
+
+    def test_each_browser_is_asked_for_its_own_address_bar_class(self):
+        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai') as read:
+            self.assertEqual(yakala.windows_browser_url(42, 'Brave'), 'https://github.com/avenoxai')
+            self.assertEqual(yakala.windows_browser_url(42, 'msedge'), 'https://github.com/avenoxai')
+            self.assertIsNone(yakala.windows_browser_url(42, 'firefox'))
+        self.assertEqual([c.args for c in read.call_args_list], [(42, 'BraveOmniboxViewViews'), (42, 'OmniboxViewViews')])
+
+    def test_reader_failure_falls_back_to_the_clipboard(self):
+        with patch.object(yakala, '_uia_address_bar', side_effect=OSError('UI Automation yok')):
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
+        with patch.object(yakala, '_uia_address_bar', return_value=None):
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))  # no omnibox found
+
+    def test_a_slow_browser_costs_at_most_the_timeout(self):
+        release, finished = threading.Event(), threading.Event()
+
+        def slow(*_):
+            release.wait(10)
+            finished.set()
+            return 'late.example.com'
+        with patch.object(yakala, '_uia_address_bar', side_effect=slow) as read:
+            try:
+                started = time.monotonic()
+                self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
+                self.assertLess(time.monotonic() - started, 2)
+                # A timed-out COM provider keeps only its original worker. Repeated hotkeys return
+                # immediately instead of leaking one daemon/apartment on every press.
+                for _ in range(10):
+                    self.assertIsNone(yakala.windows_browser_url(42, 'chrome', timeout=0.1))
+                self.assertEqual(read.call_count, 1)
+            finally:
+                release.set()
+                self.assertTrue(finished.wait(2))
+                self.assertTrue(wait_until(lambda: not any(t.name == 'yakala-adres' for t in threading.enumerate()), 2))
+        with patch.object(yakala, '_uia_address_bar', return_value='github.com/avenoxai'):
+            self.assertEqual(yakala.windows_browser_url(42, 'chrome'), 'https://github.com/avenoxai')
+
+    @unittest.skipUnless(WINDOWS, 'IsHungAppWindow is Windows only')
+    def test_a_hung_window_is_not_asked_at_all(self):
+        with patch.object(ctypes.windll.user32, 'IsHungAppWindow', return_value=1), \
+                patch.object(yakala, '_uia_address_bar') as read:
+            self.assertIsNone(yakala.windows_browser_url(42, 'chrome'))
+        read.assert_not_called()
+
+    @unittest.skipUnless(WINDOWS, 'UI Automation is Windows only')
+    def test_real_ui_automation_with_a_dead_window_gives_nothing_and_releases_com(self):
+        # The real COM path end to end: ElementFromHandle fails on a closed handle and nothing escapes.
+        self.assertIsNone(yakala.windows_browser_url(0, 'chrome'))
+        seen = {}
+
+        def run():
+            with self.assertRaises(OSError):
+                yakala._uia_address_bar(0, 'OmniboxViewViews')
+            # Balanced: COM is not left initialised on the thread, so this is a fresh S_OK, not S_FALSE.
+            seen['again'] = ctypes.windll.ole32.CoInitializeEx(None, 2)
+            ctypes.windll.ole32.CoUninitialize()
+        worker = threading.Thread(target=run)
+        worker.start()
+        worker.join(10)
+        self.assertEqual(seen.get('again'), 0)
+
+
 class FakeSession:
     """What the listener uses of one logon session: named events and mutexes with handle
     counts, the hotkey table and one message queue per thread. Serves as user32 and kernel32."""
@@ -893,9 +969,9 @@ class WindowsListenerTest(unittest.TestCase):
         self.assertEqual(result, {'code': 0})
         argv = spawn.call_args_list[0].args[0]
         self.assertEqual(argv[1:], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve()), '--hazir'])
-        # The same two facts the window gathered for itself when the Start menu shortcut opened it.
+        # The warm-window context also carries an active Chromium tab's URL and title.
         line = waiting.stdin.write.call_args_list[0].args[0]
-        self.assertLessEqual(set(json.loads(line.decode('utf-8'))), {'pencere', 'uygulama'})
+        self.assertLessEqual(set(json.loads(line.decode('utf-8'))), {'pencere', 'uygulama', 'url', 'baslik'})
 
     def test_shortcut_content_and_clean_rewrite(self):
         link = self.root / 'kısayollar' / 'Beyne At Dinleyici deneme.lnk'
