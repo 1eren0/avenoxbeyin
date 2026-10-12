@@ -379,6 +379,7 @@ class YakalaUnitTest(unittest.TestCase):
         for field in ('name', 'behavior', 'properties', 'noteContentFormat', 'noteNameFormat', 'path'):
             self.assertIn(field, template)
         self.assertEqual(template['path'], INBOX)
+        self.assertEqual(template['noteNameFormat'], '{{date|date:"YYYY-MM-DD-HHmm"}}-{{title|safe_name|kebab|slice:0,48}}')
         names = {prop['name']: prop['value'] for prop in template['properties']}
         self.assertEqual((names['tur'], names['durum']), ('yakala', 'bekliyor'))
         self.assertTrue(all(prop['type'] in ('text', 'multitext', 'number', 'checkbox', 'date', 'datetime')

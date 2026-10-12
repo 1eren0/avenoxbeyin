@@ -2193,7 +2193,7 @@ def clipper_template(inbox_path=None):
         'schemaVersion': '0.1.0',
         'name': TEMPLATE_NAME,
         'behavior': 'create',
-        'noteNameFormat': '{{date|date:"YYYY-MM-DD-HHmm"}}-{{title|safe_name|lower|slice:0,48}}',
+        'noteNameFormat': '{{date|date:"YYYY-MM-DD-HHmm"}}-{{title|safe_name|kebab|slice:0,48}}',
         'path': inbox_path or INBOX,
         'noteContentFormat': '# {{title}}\n\n## Neden\n\n\n\n## Kaynak\n\n{{url}}\n\n## Secim\n\n{{selection}}\n\n## Icerik\n\n{{content}}\n',
         'properties': [
