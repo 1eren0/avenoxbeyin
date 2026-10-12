@@ -777,11 +777,30 @@ def _without_section(body, name, replacement):
     return re.sub(r'^## ' + name + r'\s*$.*?(?=^## |\Z)', '## ' + name + '\n\n' + replacement + '\n\n', body, count=1, flags=re.M | re.S)
 
 
+def _windows_reserved_name(part):
+    """Windows device names on every host, including after pathlib removes its API."""
+    native = getattr(os.path, 'isreserved', None)
+    if callable(native):
+        return native(part)
+    legacy = getattr(PureWindowsPath(part), 'is_reserved', None)
+    if callable(legacy):
+        import warnings
+        # POSIX has no os.path.isreserved; keep the requested legacy check there
+        # without its deprecation warning breaking callers using -W error.
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', DeprecationWarning)
+            return legacy()
+    # Python 3.15+ on POSIX may have neither API. Match pathlib's device-name rule.
+    name = part.partition('.')[0].partition(':')[0].rstrip(' ').upper()
+    return name in ('CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$') or bool(
+        re.fullmatch(r'(?:COM|LPT)[1-9¹²³]', name))
+
+
 def _safe_vault_file(vault_root, link):
     """Reject Windows anchors/UNC and traversal before resolve can initiate SMB I/O."""
     windows = PureWindowsPath(link)
     if (windows.drive or windows.anchor or not windows.parts or any(
-            part == '..' or ':' in part or part.endswith((' ', '.')) or PureWindowsPath(part).is_reserved()
+            part == '..' or ':' in part or part.endswith((' ', '.')) or _windows_reserved_name(part)
             for part in windows.parts)):
         raise ValueError('Yakala dosya baglantisi vault disinda veya gecersiz: ' + link)
     path = vault_root.joinpath(*windows.parts).resolve()

@@ -1,5 +1,6 @@
 """#299: yakala security regressions. Runs without network or external helpers."""
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from contextlib import ExitStack
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import socket
 import sys
 import tempfile
 import unittest
+import warnings
 from unittest.mock import patch
 
 from v3_package_helpers import build_package, inherited_env, isolated_env
@@ -28,6 +30,47 @@ class YakalaSecurityTest(unittest.TestCase):
         self.vault = self.root / 'vault'
         self.vault.mkdir()
         self.no_tools = {key: None for key in ('npx', 'yt_dlp', 'whisper', 'pdftotext', 'ffmpeg')}
+
+    def test_file_cards_reject_reserved_names_when_both_apis_are_removed(self):
+        valid = self.vault / 'valid.txt'
+        valid.write_text('VALID-FILE-CONTENT', encoding='utf-8')
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.path.__dict__))
+            os.path.__dict__.pop('isreserved', None)
+            for owner in PureWindowsPath.__mro__:
+                if 'is_reserved' in owner.__dict__:
+                    stack.enter_context(patch.object(owner, 'is_reserved'))
+                    delattr(owner, 'is_reserved')
+            self.assertFalse(hasattr(os.path, 'isreserved'))
+            self.assertFalse(hasattr(PureWindowsPath, 'is_reserved'))
+            for name in ('CON', 'nul.txt', 'COM1.md', 'LPT9.txt', 'COM¹.md', 'CONOUT$'):
+                card = {'meta': {'kaynak_turu': 'dosya'}, 'body': '## Dosyalar\n\n[[' + name + ']]'}
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    yakala.extract(self.vault, card, self.no_tools)
+            card = {'meta': {'kaynak_turu': 'dosya'}, 'body': '## Dosyalar\n\n[[valid.txt]]'}
+            self.assertIn('VALID-FILE-CONTENT', yakala.extract(self.vault, card, self.no_tools)[0])
+
+    def test_file_cards_prefer_native_reserved_check_over_deprecated_pathlib(self):
+        with patch.object(os.path, 'isreserved', return_value=True, create=True) as native, \
+                patch.object(PureWindowsPath, 'is_reserved', side_effect=AssertionError('deprecated API used'), create=True):
+            for name in ('CON', 'NUL.txt', 'COM1.md'):
+                card = {'meta': {'kaynak_turu': 'dosya'}, 'body': '## Dosyalar\n\n[[' + name + ']]'}
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    yakala.extract(self.vault, card, self.no_tools)
+                native.assert_called_with(name)
+
+    def test_legacy_reserved_check_remains_warning_free_for_posix_hosts(self):
+        def legacy(path):
+            warnings.warn('PurePath.is_reserved is deprecated', DeprecationWarning)
+            return path.name.upper().split('.')[0] in ('CON', 'NUL', 'COM1')
+
+        with patch.dict(os.path.__dict__), \
+                patch.object(PureWindowsPath, 'is_reserved', legacy, create=True), warnings.catch_warnings():
+            os.path.__dict__.pop('isreserved', None)
+            warnings.simplefilter('error', DeprecationWarning)
+            for name in ('CON', 'NUL.txt', 'COM1.md'):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    yakala._safe_vault_file(self.vault, name)
 
     def test_capture_public_urls_remains_offline(self):
         with patch.object(socket, 'getaddrinfo', side_effect=AssertionError('capture cannot use DNS')):
