@@ -297,14 +297,18 @@ class YakalaUnitTest(unittest.TestCase):
 
             def measure(self, text):
                 return 10 * len(text)
-        canvas = Mock()
-        canvas.winfo_toplevel.return_value = '.fit-test'
-        with patch('tkinter.font.Font', Font), patch.dict(yakala._FONTS, clear=True):
-            self.assertEqual(yakala._fit(canvas, 'kisa', ('f', 12), 100), 'kisa')
-            self.assertEqual(yakala._fit(canvas, 'abcdefghijkl', ('f', 12), 60), 'abcde…')
-            self.assertEqual(yakala._fit(canvas, 'ab   cdefgh', ('f', 12), 60), 'ab…')
-            self.assertEqual(yakala._fit(canvas, 'abc', ('f', 12), 5), '…')
-            self.assertEqual(len(yakala._FONTS), 1)
+        class Canvas:  # stands in for a Tk canvas: the cache lives on it
+            pass
+        first, second = Canvas(), Canvas()
+        with patch('tkinter.font.Font', Font):
+            self.assertEqual(yakala._fit(first, 'kisa', ('f', 12), 100), 'kisa')
+            self.assertEqual(yakala._fit(first, 'abcdefghijkl', ('f', 12), 60), 'abcde…')
+            self.assertEqual(yakala._fit(first, 'ab   cdefgh', ('f', 12), 60), 'ab…')
+            self.assertEqual(yakala._fit(first, 'abc', ('f', 12), 5), '…')
+            self.assertEqual(list(first._fit_fonts), [('f', 12)])
+            # Another window's canvas, even in the same process, builds its own font.
+            yakala._fit(second, 'kisa', ('f', 12), 100)
+            self.assertIsNot(second._fit_fonts[('f', 12)], first._fit_fonts[('f', 12)])
 
     def test_kind_and_slug(self):
         self.assertEqual(yakala.kind_of('https://m.youtube.com/watch?v=1'), 'youtube')

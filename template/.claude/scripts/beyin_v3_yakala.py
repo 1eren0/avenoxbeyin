@@ -1043,16 +1043,13 @@ def _round_rect(canvas, x1, y1, x2, y2, radius, **options):
     return canvas.create_polygon(points, smooth=True, splinesteps=24, **options)
 
 
-_FONTS = {}
-
-
 def _fit(canvas, text, font, width):
     """Trim with an ellipsis so the text fits `width` pixels in `font`."""
     import tkinter.font as tkfont
-    key = (str(canvas.winfo_toplevel()), font)
-    if key not in _FONTS:  # building a Font is the expensive part; one per window and description
-        _FONTS[key] = tkfont.Font(root=canvas, font=font)
-    measure = _FONTS[key].measure
+    fonts = canvas.__dict__.setdefault('_fit_fonts', {})  # dies with its canvas, never shared between Tk roots
+    if font not in fonts:  # building a Font is the expensive part; one per window and description
+        fonts[font] = tkfont.Font(root=canvas, font=font)
+    measure = fonts[font].measure
     if measure(text) <= width:
         return text
     low, high = 0, len(text)  # longest prefix that fits with the ellipsis
@@ -1693,12 +1690,40 @@ def warm_popup(vault, state=None):
     The listener keeps one of these ready and writes the context to its stdin when the key is
     pressed; a closed pipe (the listener stopped) ends it without a window.
     """
+    import queue
+    import threading
     import tkinter as tk
     root = tk.Tk()
     root.withdraw()
     _window_chrome(root)
-    root.update_idletasks()
-    line = sys.stdin.buffer.readline() if sys.stdin else b''
+    lines = queue.Queue()
+
+    def wait():
+        try:
+            lines.put(sys.stdin.buffer.readline() if sys.stdin else b'')
+        except Exception:
+            lines.put(b'')
+        try:  # wake the loop now; Tk runs a call from another thread on its own thread
+            root.event_generate('<<Uyan>>', when='tail')
+        except Exception:
+            pass  # the slow poll below still finds the line
+
+    def check(_event=None):
+        try:
+            got['line'] = lines.get_nowait()
+        except queue.Empty:
+            if _event is None:
+                root.after(500, check)
+            return
+        root.quit()
+    got = {}
+    # Windows marks a window that stops reading messages as hung after 5 s, and a hung top-level
+    # window can stall broadcasts and log-off: Tk's loop keeps running while it waits.
+    root.bind('<<Uyan>>', check)
+    root.after(500, check)
+    threading.Thread(target=wait, name='yakala-hazir', daemon=True).start()
+    root.mainloop()
+    line = got.get('line', b'')
     if not line.strip():
         root.destroy()
         return {'status': 'vazgecildi'}
@@ -2063,18 +2088,27 @@ def listen_windows(vault, script, spec=None, state=None):
             context = windows_context()
             child, warm['child'] = warm['child'], None
             try:
+                # The key press gave this process the right to take the foreground; pass it on before
+                # the window wakes, or it can open behind the active application and the typing goes there.
+                user32.AllowSetForegroundWindow(child.pid)
                 child.stdin.write(json.dumps(context).encode('utf-8') + b'\n')
                 child.stdin.close()
             except Exception:  # none ready, or it died: start one the old way
                 child = subprocess.Popen(window_command('--baglam', json.dumps(context)),
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                          stderr=subprocess.DEVNULL, creationflags=NO_WINDOW)
-            # The key press gave this process the right to take the foreground; pass it on, or the
-            # window can open behind the active application and the typing goes to that one.
-            user32.AllowSetForegroundWindow(child.pid)
+                user32.AllowSetForegroundWindow(child.pid)
         except Exception:
             pass
         prepare()
+
+    def dismiss():
+        # A closed pipe tells the waiting window to exit without showing anything.
+        child, warm['child'] = warm['child'], None
+        try:
+            child.stdin.close()
+        except Exception:
+            pass
 
     # The stop event is also the session lock: the process that created it is the listener.
     ctypes.set_last_error(0)
@@ -2111,6 +2145,7 @@ def listen_windows(vault, script, spec=None, state=None):
                     if msg.message == 0x0312:  # WM_HOTKEY
                         pressed()
         finally:
+            dismiss()
             user32.UnregisterHotKey(None, hotkey_id)
     finally:
         if mutex:

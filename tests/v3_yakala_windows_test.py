@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -169,6 +170,41 @@ class JsonTextTest(unittest.TestCase):
         # A lone surrogate (a file name the system could not decode) cannot be written as UTF-8.
         self.assertEqual(yakala._json_text({'ad': 'x\udcff'}, Mock(encoding='utf-8', closed=False)),
                          '{\n  "ad": "x\\udcff"\n}')
+
+
+@unittest.skipUnless(WINDOWS, 'the waiting window is a real Windows process')
+class WarmWindowTest(unittest.TestCase):
+    """`pencere --hazir` as the listener starts it: alive to Windows while it waits, gone when the pipe closes."""
+
+    def top_level_windows(self, pid):
+        user32 = ctypes.windll.user32
+        found = []
+        callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def each(hwnd, _param):
+            owner = ctypes.c_ulong()
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
+            if owner.value == pid:
+                found.append(hwnd)
+            return True
+        user32.EnumWindows(callback(each), None)
+        return found
+
+    def test_waiting_window_answers_messages_and_exits_when_the_pipe_closes(self):
+        vault = Path(tempfile.mkdtemp(prefix='v3-yakala-hazir-'))
+        self.addCleanup(shutil.rmtree, vault, True)
+        child = subprocess.Popen([sys.executable, str(MODULE), 'pencere', '--vault', str(vault), '--hazir'],
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.assertTrue(wait_until(lambda: self.top_level_windows(child.pid), 30), 'Tk never created a window')
+        time.sleep(0.5)  # well past start-up: from here on it only waits for the key
+        user32 = ctypes.windll.user32
+        for hwnd in self.top_level_windows(child.pid):
+            answer = ctypes.c_size_t()
+            # WM_NULL with SMTO_ABORTIFHUNG: a window that stopped reading messages times out here.
+            self.assertTrue(user32.SendMessageTimeoutW(ctypes.c_void_p(hwnd), 0, 0, 0, 0x0002, 2000, ctypes.byref(answer)))
+        child.stdin.close()
+        self.assertEqual(child.wait(15), 0)
 
 
 class FakeSession:
@@ -345,9 +381,12 @@ class ListenerFlowTest(unittest.TestCase):
         self.assertEqual(argv[1:], [str(MODULE.resolve()), 'pencere', '--vault', str(self.vault.resolve()), '--hazir'])
         self.assertEqual(spawn.call_args.kwargs['stdin'], subprocess.PIPE)
         context = {'uygulama': 'chrome', 'pencere': 'Şifre & Müşteri'}
+        windows[0].stdin.write.side_effect = lambda _line: self.session.calls.append(('wake', 4321))
         with patch.object(yakala, 'windows_context', return_value=context):
             self.session.press(0x4003, ord('B'))
-            self.assertTrue(wait_until(lambda: ('foreground', 4321) in self.session.calls, 10))
+            self.assertTrue(wait_until(lambda: ('wake', 4321) in self.session.calls, 10))
+        # The foreground right is handed over before the window wakes, never after.
+        self.assertLess(self.session.calls.index(('foreground', 4321)), self.session.calls.index(('wake', 4321)))
         # The key hands the context to the waiting window and readies the next one.
         line = windows[0].stdin.write.call_args.args[0]
         self.assertEqual(json.loads(line.decode('utf-8')), context)
@@ -356,9 +395,13 @@ class ListenerFlowTest(unittest.TestCase):
         self.assertIn('--hazir', spawn.call_args.args[0])
         yakala._windows_stop_listener(self.other, timeout=1)  # another vault's uninstall
         self.assertTrue(thread.is_alive() and yakala._windows_listener_running(self.vault))
+        self.assertFalse(windows[1].stdin.close.called)
         yakala._windows_stop_listener(self.vault, timeout=5)
         thread.join(10)
         self.assertEqual(result, {'code': 0})
+        # Stopping closes the pipe of the window still waiting, which ends it without a window.
+        self.assertTrue(windows[1].stdin.close.called)
+        windows[1].stdin.write.assert_not_called()
         self.assertEqual((self.session.hotkeys, self.session.objects, self.session.handles), ({}, {}, {}))
         yakala._windows_stop_listener(self.vault, timeout=1)  # twice is harmless
 
@@ -376,6 +419,20 @@ class ListenerFlowTest(unittest.TestCase):
         argv = spawn.call_args_list[1].args[0]
         self.assertEqual(json.loads(argv[argv.index('--baglam') + 1]), context)
         self.assertTrue(wait_until(lambda: spawn.call_count == 3, 10))
+
+    def test_quick_presses_each_get_their_own_window(self):
+        windows = [Mock(pid=4321 + n) for n in range(4)]
+        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=windows).start()
+        self.addCleanup(patch.stopall)
+        self.listen(self.vault)
+        self.assertTrue(wait_until(lambda: spawn.call_count == 1, 10))
+        with patch.object(yakala, 'windows_context', side_effect=[{'pencere': 'bir'}, {'pencere': 'iki'}, {'pencere': 'uc'}]):
+            for _ in range(3):  # back to back: the next window may still be starting, it is still the one used
+                self.session.press(0x4003, ord('B'))
+            self.assertTrue(wait_until(lambda: spawn.call_count == 4, 10))
+        sent = [json.loads(w.stdin.write.call_args.args[0])['pencere'] for w in windows[:3]]
+        self.assertEqual(sent, ['bir', 'iki', 'uc'])
+        self.assertEqual([('foreground', w.pid) in self.session.calls for w in windows], [True, True, True, False])
 
     def test_a_taken_key_never_looks_like_a_running_listener(self):
         self.session.hotkeys[(0x4003, ord('B'))] = -1  # another application owns the combination
