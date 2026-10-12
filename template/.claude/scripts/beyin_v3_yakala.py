@@ -2100,13 +2100,20 @@ def listen_windows(vault, script, spec=None, state=None):
                 user32.AllowSetForegroundWindow(child.pid)
         except Exception:
             pass
-        prepare()
+        if warm['child'] is None:
+            prepare()
 
     def dismiss():
-        # A closed pipe tells the waiting window to exit without showing anything.
+        # A closed pipe tells the waiting window to exit without showing anything. Reap our own
+        # child too; a failed Tk startup must not survive listener shutdown.
         child, warm['child'] = warm['child'], None
         try:
             child.stdin.close()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                child.wait(timeout=2)
         except Exception:
             pass
 

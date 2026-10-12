@@ -194,8 +194,16 @@ class WarmWindowTest(unittest.TestCase):
         vault = Path(tempfile.mkdtemp(prefix='v3-yakala-hazir-'))
         self.addCleanup(shutil.rmtree, vault, True)
         child = subprocess.Popen([sys.executable, str(MODULE), 'pencere', '--vault', str(vault), '--hazir'],
-                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: child.poll() is None and child.kill())
+                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 env=inherited_env())
+
+        def stop_child():
+            if child.stdin and not child.stdin.closed:
+                child.stdin.close()
+            if child.poll() is None:
+                child.kill()
+            child.wait(15)
+        self.addCleanup(stop_child)
         self.assertTrue(wait_until(lambda: self.top_level_windows(child.pid), 30), 'Tk never created a window')
         time.sleep(0.5)  # well past start-up: from here on it only waits for the key
         user32 = ctypes.windll.user32
@@ -366,8 +374,10 @@ class ListenerFlowTest(unittest.TestCase):
 
     def test_registers_reports_opens_the_window_and_stops_by_name(self):
         windows = [Mock(pid=4321), Mock(pid=4322)]
-        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=windows).start()
-        self.addCleanup(patch.stopall)
+        spawn_patch = patch.object(yakala.subprocess, 'Popen', side_effect=windows)
+        spawn = spawn_patch.start()
+        self.addCleanup(spawn_patch.stop)
+        self.addCleanup(self.stop_all)  # stop the listener while the Popen/Win32 fakes are still installed
         thread, result = self.listen(self.vault)
         self.assertTrue(wait_until(lambda: yakala._windows_listener_running(self.vault), 10))
         self.assertEqual(list(self.session.hotkeys), [(0x4003, ord('B'))])
@@ -408,8 +418,10 @@ class ListenerFlowTest(unittest.TestCase):
     def test_a_dead_waiting_window_falls_back_to_a_fresh_one(self):
         dead, fresh, next_one = Mock(pid=1), Mock(pid=4321), Mock(pid=2)
         dead.stdin.write.side_effect = BrokenPipeError
-        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=[dead, fresh, next_one]).start()
-        self.addCleanup(patch.stopall)
+        spawn_patch = patch.object(yakala.subprocess, 'Popen', side_effect=[dead, fresh, next_one])
+        spawn = spawn_patch.start()
+        self.addCleanup(spawn_patch.stop)
+        self.addCleanup(self.stop_all)  # stop the listener while the Popen/Win32 fakes are still installed
         self.listen(self.vault)
         self.assertTrue(wait_until(lambda: spawn.call_count == 1, 10))
         context = {'uygulama': 'code', 'pencere': 'not'}
@@ -422,8 +434,10 @@ class ListenerFlowTest(unittest.TestCase):
 
     def test_quick_presses_each_get_their_own_window(self):
         windows = [Mock(pid=4321 + n) for n in range(4)]
-        spawn = patch.object(yakala.subprocess, 'Popen', side_effect=windows).start()
-        self.addCleanup(patch.stopall)
+        spawn_patch = patch.object(yakala.subprocess, 'Popen', side_effect=windows)
+        spawn = spawn_patch.start()
+        self.addCleanup(spawn_patch.stop)
+        self.addCleanup(self.stop_all)  # stop the listener while the Popen/Win32 fakes are still installed
         self.listen(self.vault)
         self.assertTrue(wait_until(lambda: spawn.call_count == 1, 10))
         with patch.object(yakala, 'windows_context', side_effect=[{'pencere': 'bir'}, {'pencere': 'iki'}, {'pencere': 'uc'}]):
@@ -433,6 +447,23 @@ class ListenerFlowTest(unittest.TestCase):
         sent = [json.loads(w.stdin.write.call_args.args[0])['pencere'] for w in windows[:3]]
         self.assertEqual(sent, ['bir', 'iki', 'uc'])
         self.assertEqual([('foreground', w.pid) in self.session.calls for w in windows], [True, True, True, False])
+
+    def test_context_failure_keeps_the_waiting_child_and_shutdown_reaps_it(self):
+        waiting = Mock(pid=4321)
+        with patch.object(yakala.subprocess, 'Popen', return_value=waiting) as spawn:
+            thread, result = self.listen(self.vault)
+            self.assertTrue(wait_until(lambda: spawn.called, 10))
+            with patch.object(yakala, 'windows_context', side_effect=RuntimeError('provider failed')) as read:
+                self.session.press(0x4003, ord('B'))
+                self.assertTrue(wait_until(lambda: read.called, 10))
+                # Let pressed() finish before checking that it did not abandon the ready child.
+                self.assertTrue(wait_until(lambda: not self.session.queues.get(thread.native_id), 10))
+                yakala._windows_stop_listener(self.vault, timeout=5)
+                thread.join(10)
+            self.assertEqual(result, {'code': 0})
+            self.assertEqual(spawn.call_count, 1)
+            waiting.stdin.close.assert_called_once()
+            waiting.wait.assert_called_once_with(timeout=2)
 
     def test_a_taken_key_never_looks_like_a_running_listener(self):
         self.session.hotkeys[(0x4003, ord('B'))] = -1  # another application owns the combination
