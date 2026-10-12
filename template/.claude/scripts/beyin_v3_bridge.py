@@ -71,6 +71,9 @@ def _visible(record):
 
 def _fresh(vault, record):
     """Indexed source still exists inside the vault and matches the indexed hash."""
+    from beyin_v3_hygiene import sensitive_source
+    if sensitive_source(record.get('source')):
+        return False
     try:
         target = (vault / record['source']).resolve()
         return (target.is_relative_to(vault) and target.is_file() and

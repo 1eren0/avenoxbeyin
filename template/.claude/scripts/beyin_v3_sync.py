@@ -21,6 +21,7 @@ if _MODULE_DIR not in sys.path:
 from beyin_v3 import (HARNESSES, REJECTED_AT, RETIRED_STATUSES, MemoryStore, ReceiptConflict, RevisionConflict, _json,
                       _path_redirected, _rejected_inference, _status_word, rejected_dependents, resolve_supersedes)
 from beyin_v3_index import applied_keys, dir_key, exclusions as index_exclusions, prune as prune_excluded
+from beyin_v3_hygiene import sensitive_excluded
 from beyin_v3_projections import project_receipts
 from beyin_v3_preferences import read as read_preferences
 from beyin_v3_secrets import redact as redact_secrets, record as record_redactions
@@ -732,7 +733,8 @@ class SyncEngine:
         # what the list took out of the index.
         excluded = self.excluded_dir_keys = applied_keys(excluded, EXCLUDED_DIRS)
         for directory, dirs, files in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.casefold() not in EXCLUDED_DIRS and not (Path(directory) / d).is_symlink())
+            dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d.casefold() not in EXCLUDED_DIRS
+                             and not sensitive_excluded(d) and not (Path(directory) / d).is_symlink())
             if excluded:
                 # Pruned here, so an excluded tree is never listed, read or hashed.
                 dirs[:] = prune_excluded(self.root, directory, dirs, excluded, self.index_exclusions)

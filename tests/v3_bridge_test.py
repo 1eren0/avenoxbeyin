@@ -62,6 +62,20 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn(str(self.project), json.dumps(events))
         self.assertNotIn('TRANSCRIPT_CANARY', json.dumps(events))
 
+    def test_sensitive_folder_task_cannot_enter_external_project_context(self):
+        secret = self.vault / '🔐 Kasa/task.md'
+        secret.parent.mkdir()
+        secret.write_text('Task details from a private folder', encoding='utf-8')
+        safe = self.vault / 'notes/task.md'
+        safe.parent.mkdir()
+        safe.write_text('Ordinary task', encoding='utf-8')
+        record = {'source': secret.relative_to(self.vault).as_posix(),
+                  'source_sha256': hashlib.sha256(secret.read_bytes()).hexdigest()}
+        self.assertFalse(bridge._fresh(self.vault, record))
+        record = {'source': safe.relative_to(self.vault).as_posix(),
+                  'source_sha256': hashlib.sha256(safe.read_bytes()).hexdigest()}
+        self.assertTrue(bridge._fresh(self.vault, record))
+
     def test_vault_subdirectory_and_other_installed_vault_skip_duplicates(self):
         for cwd in (self.vault, self.vault / 'nested', self.project):
             cwd.mkdir(exist_ok=True)

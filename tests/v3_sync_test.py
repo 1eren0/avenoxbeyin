@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Source-authoritative synchronization contract, synthetic local fixtures only."""
+import hashlib
 import importlib.util
 import json
 from datetime import datetime
@@ -74,6 +75,46 @@ class SourceSyncTest(unittest.TestCase):
         deleted = self.engine.sync()
         self.assertGreaterEqual(deleted['deleted'], 1)
         self.assertEqual(self.records(), [])
+
+    def test_sensitive_folder_sources_are_not_read_or_indexed(self):
+        # These directories were already skipped by hygiene, but not by the sync reader.
+        safe = self.write('notes/normal.md', id='safe')
+        sensitive = ('🔐 Kasa', '410-Şifreler', 'MÜŞTERİLER', 'Private',
+                     'notes/Secret', 'Kimlik Belgeleri')
+        for index, folder in enumerate(sensitive):
+            self.write(folder + '/hidden.md', id='secret-' + str(index), body='Nebula calibration PRIVATE_ONLY.\\n')
+        result = self.engine.sync()
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual([record['source'] for record in self.engine.store._records()],
+                         [safe.relative_to(self.vault).as_posix()])
+        self.assertEqual([record['id'] for record in self.records()], ['safe'])
+        for folder in sensitive:
+            self.assertTrue((self.vault / folder / 'hidden.md').exists())  # Nothing is deleted.
+
+    def test_sensitive_folder_move_removes_old_index_entry(self):
+        path = self.write('notes/task.md')
+        self.engine.sync()
+        target = self.vault / '🔐 Kasa/task.md'
+        target.parent.mkdir()
+        path.rename(target)
+        result = self.engine.sync()
+        self.assertGreaterEqual(result['deleted'], 1)
+        self.assertEqual(self.records(), [])
+        self.assertTrue(target.is_file())
+
+    def test_previously_indexed_sensitive_source_is_withheld_before_sync(self):
+        self.write('notes/normal.md', id='safe')
+        self.engine.sync()
+        record = dict(self.engine.store._records()[0])
+        private = self.write('🔐 Kasa/hidden.md', id='hidden')
+        record['source'] = private.relative_to(self.vault).as_posix()
+        record['source_sha256'] = hashlib.sha256(private.read_bytes()).hexdigest()
+        # Simulate a row indexed by an older release: the file still exists and the hash matches.
+        eligible, _ = self.engine.store._eligible(records=[record])
+        self.assertEqual(eligible, [])
+        from beyin_v3_projections import _hidden_ref_sources
+        with self.engine.store._connect() as db:
+            self.assertIn(record['source'], _hidden_ref_sources(db, [record['source']]))
 
     def test_unresolved_git_conflict_markers_are_reported_and_not_indexed(self):
         # #205: a pull --rebase that stops on a conflict leaves markers the agent would read as content.
